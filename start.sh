@@ -28,20 +28,18 @@ error() { echo -e "${RED}  ✗ $1${NC}"; exit 1; }
 # Check dependencies
 # ---------------------------------------------------------------------------
 check_python() {
-    if command -v python3 &>/dev/null; then
-        PYTHON="python3"
-    elif command -v python &>/dev/null; then
-        PYTHON="python"
-    else
-        error "Python is not installed. Please install Python 3.10+"
+    if [ ! -x .venv/bin/python ]; then
+        info "Preparing local Python environment..."
+        bash ./setup.sh
     fi
-    ok "Python: $($PYTHON --version)"
+    PYTHON="$(pwd)/.venv/bin/python"
+    "$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 12))' || error "Python 3.12+ is required in .venv."
+    ok "Python: $("$PYTHON" --version)"
 }
 
 check_node() {
-    if ! command -v node &>/dev/null; then
-        error "Node.js is not installed. Please install Node.js 18+ (https://nodejs.org)"
-    fi
+    command -v node >/dev/null && command -v npm >/dev/null || error "Node.js and npm are required (Node 20.19+ or 22.12+)."
+    node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(((a===20 && b>=19)||(a===22 && b>=12)||a>22) ? 0 : 1)' || error "Node.js 20.19+ or 22.12+ is required (Node 21 is unsupported)."
     ok "Node.js: $(node --version)"
 }
 
@@ -53,18 +51,18 @@ check_rust() {
 }
 
 install_python_deps() {
-    if ! $PYTHON -c "import fastapi" 2>/dev/null; then
-        info "Installing Python dependencies..."
-        $PYTHON -m pip install -q fastapi "uvicorn[standard]" websockets requests
-    fi
+    # Enforce the declared versions even when all imports happen to succeed.
+    info "Checking Python dependencies in .venv..."
+    "$PYTHON" -m pip install -r server/requirements.txt
+    "$PYTHON" -m pip check || error "Python dependencies are inconsistent."
+    "$PYTHON" -c "import fastapi, uvicorn, websockets, requests" || error "Python dependencies are incomplete."
     ok "Python dependencies ready"
 }
 
 install_node_deps() {
-    if [ ! -d "web/node_modules" ]; then
-        info "Installing Node.js dependencies..."
-        cd web && npm install && cd ..
-    fi
+    [ -f web/package-lock.json ] || error "web/package-lock.json is required for npm ci."
+    info "Installing locked Node.js dependencies..."
+    (cd web && npm ci --include=optional --no-audit --no-fund) || error "npm ci failed."
     ok "Node.js dependencies ready"
 }
 
@@ -79,7 +77,7 @@ check_hyperliquid_repo() {
 
 build_web() {
     info "Building frontend..."
-    cd web && npm run build && cd ..
+    (cd web && npm run build) || error "Frontend build failed."
     ok "Frontend build complete → web/dist/"
 }
 
@@ -114,7 +112,7 @@ case "$MODE" in
         install_python_deps
         check_hyperliquid_repo
         info "Starting API server..."
-        $PYTHON -m uvicorn server.main:app --host 127.0.0.1 --port 8787
+        exec "$PYTHON" -m uvicorn server.main:app --host 127.0.0.1 --port 8787
         ;;
 
     --build-web)
@@ -161,7 +159,7 @@ case "$MODE" in
 
         info "Starting server..."
         echo ""
-        $PYTHON server/main.py --no-reload
+        exec "$PYTHON" server/main.py --no-reload
         ;;
 
     *)

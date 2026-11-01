@@ -1,26 +1,16 @@
 #!/usr/bin/env bash
-# First-time setup for standalone funding-arb project.
+# Prepare a local development environment without modifying system Python.
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")" && pwd)"
-cd "$ROOT"
-
-if [[ ! -f .env ]]; then
-  cp .env.example .env
-  echo "Created .env from .env.example — edit before live trading."
+cd "$(dirname "$0")"
+command -v python3 >/dev/null || { echo "Python 3.12+ is required." >&2; exit 1; }
+python3 -c 'import sys; sys.exit(sys.version_info < (3, 12))' || { echo "Python 3.12+ is required." >&2; exit 1; }
+if [[ ! -x .venv/bin/python ]]; then
+    python3 -m venv .venv || { echo "Could not create .venv; install the python3-venv package." >&2; exit 1; }
 fi
-
-mkdir -p data output runs/.state
-touch data/.gitkeep runs/.state/.gitkeep
-
-if ! python3 -c "import json" 2>/dev/null; then
-  echo "Python 3 required."
-  exit 1
+.venv/bin/python -m pip install -r server/requirements.txt
+if [[ ! -e .env ]]; then
+    cp -n .env.example .env
+    echo "Created .env from .env.example."
 fi
-
-echo ""
-echo "Setup complete."
-echo "  Scan:      python3 scripts/cli/scan_pure_futures_spreads.py --verbose"
-echo "  Scan C&C:  python3 scripts/cli/scan_funding_arbitrage.py --venues bitget,bybit,okx,binance"
-echo "  Paper run: python3 scripts/execution/run_pure_futures_spread.py --config templates/config.pure_futures.spread.json --once --verbose"
-echo "  Dashboard: bash start.sh"
-echo "  Tests:     python3 -m pytest scripts/tests/ -q"
+mkdir -p data runs/.state
+printf '%s\n' 'Setup complete. Run bash start.sh, or bash start.sh --api-only.' 'For tests: .venv/bin/python -m pip install -r requirements-dev.txt'
