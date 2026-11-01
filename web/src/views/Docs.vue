@@ -130,6 +130,9 @@ function onSectionClick(id: string) {
             </div>
           </template>
 
+          <n-text v-if="locale === 'ru' && !article.sectionsByLocale.ru" depth="3" class="docs-fallback">
+            {{ t('docs.englishFallback') }}
+          </n-text>
           <doc-article-body :sections="sections" />
         </n-card>
       </main>

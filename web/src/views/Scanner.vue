@@ -565,7 +565,7 @@ async function loadVenueCapabilities() {
 function rowTradeBlock(row: PureRow): string {
   for (const vid of [row.long_venue, row.short_venue]) {
     const cap = venueCaps.value[vid]
-    if (cap && !cap.trade) return `${vid}: scan-only${cap.reason ? ` (${cap.reason})` : ''}`
+    if (cap && !cap.trade) return `${vid}: ${t('settings.scanOnly')}${isDemoMode ? ` (${t('demo.title')})` : cap.reason ? ` (${cap.reason})` : ''}`
   }
   return ''
 }
@@ -912,7 +912,7 @@ const walletLegStatus = computed(() => {
 function venueTradeBlock(...venueIds: string[]): string {
   for (const vid of venueIds) {
     const cap = venueCaps.value[vid]
-    if (cap && !cap.trade) return `${vid}: scan-only${cap.reason ? ` (${cap.reason})` : ''}`
+    if (cap && !cap.trade) return `${vid}: ${t('settings.scanOnly')}${isDemoMode ? ` (${t('demo.title')})` : cap.reason ? ` (${cap.reason})` : ''}`
   }
   return ''
 }
@@ -999,7 +999,7 @@ async function confirmOpenWallet(tgt: OpenTarget) {
   // Get real price for size conversion (USD → base currency)
   let price = await fetchBasePrice(base)
   if (price <= 0) {
-    message.error('Cannot determine market price for size calculation. Please scan first.')
+    message.error(t('scanner.marketPriceUnavailable'))
     opening.value = false
     return
   }
@@ -1164,7 +1164,7 @@ const pureStatCards = computed(() => [
 
 const pureColumns = computed<DataTableColumns<PureRow>>(() => [
   { title: t('scanner.pair'), key: 'base', width: 90, render: (row) => `${row.base}/USDT` },
-  { title: t('scanner.dir'), key: 'direction', width: 75, render: (row) => h(NTag, { size: 'small', type: row.direction === 'Forward' ? 'success' : 'warning', bordered: false }, { default: () => row.direction }) },
+  { title: t('scanner.dir'), key: 'direction', width: 75, render: (row) => h(NTag, { size: 'small', type: row.direction === 'Forward' ? 'success' : 'warning', bordered: false }, { default: () => row.direction === 'forward' ? t('scanner.forward') : row.direction === 'reverse' ? t('scanner.reverse') : row.direction }) },
   { title: t('scanner.long'), key: 'long_venue', width: 105, render: (row) => renderVenue(row.long_venue) },
   { title: t('scanner.short'), key: 'short_venue', width: 105, render: (row) => renderVenue(row.short_venue) },
   { title: t('scanner.interval'), key: 'interval', width: 90, render: (row) => {
@@ -1230,7 +1230,7 @@ const carryColumns = computed<DataTableColumns<CarryRow>>(() => [
   { title: t('scanner.type'), key: 'type', width: 80, render: (row) => h(NTag, { size: 'small', type: row._direction === 'forward' ? 'success' : 'warning', bordered: false }, { default: () => row._direction === 'forward' ? t('scanner.forward') : t('scanner.reverse') }) },
   { title: t('scanner.rate'), key: 'rate_pct', width: 100, render: (row) => (row.rate_pct ?? 0).toFixed(4) + '%' },
   { title: t('scanner.ann'), key: 'annual_pct', width: 80, render: (row) => (row.annual_pct ?? 0).toFixed(0) + '%' },
-  { title: t('scanner.spotBorrow'), key: 'spot', width: 100, render: (row) => row.has_spot === true ? 'Spot: $' + (row.spot_price ?? 0).toFixed(2) : row.borrowable === true ? 'Borrow' : 'N/A' },
+  { title: t('scanner.spotBorrow'), key: 'spot', width: 100, render: (row) => row.has_spot === true ? t('scanner.spot') + ': $' + (row.spot_price ?? 0).toFixed(2) : row.borrowable === true ? t('scanner.borrow') : t('scanner.notAvailable') },
   { title: t('scanner.netEdge'), key: 'net_edge_pct', width: 100, sorter: (a, b) => (a.net_edge_pct ?? 0) - (b.net_edge_pct ?? 0),
     render: (row) => h(NText, { type: (row.net_edge_pct ?? 0) > 0 ? 'success' : 'error', strong: true }, { default: () => (row.net_edge_pct ?? 0).toFixed(4) + '%' }) },
   { title: t('scanner.action'), key: 'actions', width: 80,
@@ -1267,7 +1267,7 @@ const unifiedStatCards = computed(() => [
 
 const unifiedColumns = computed<DataTableColumns<UnifiedCarryCand>>(() => [
   { title: t('scanner.pair'), key: 'base', width: 90, render: (row) => `${row.base}/USDT` },
-  { title: t('scanner.dir'), key: 'direction', width: 75, render: (row) => h(NTag, { size: 'small', type: row.direction === 'forward' ? 'success' : 'warning', bordered: false }, { default: () => row.direction }) },
+  { title: t('scanner.dir'), key: 'direction', width: 75, render: (row) => h(NTag, { size: 'small', type: row.direction === 'forward' ? 'success' : 'warning', bordered: false }, { default: () => row.direction === 'forward' ? t('scanner.forward') : row.direction === 'reverse' ? t('scanner.reverse') : row.direction }) },
   { title: t('scanner.futures'), key: 'futures_venue', width: 90 },
   { title: t('scanner.spot'), key: 'spot_venue', width: 90 },
   { title: t('scanner.funding'), key: 'funding_rate_pct', width: 90, render: (row) => (row.funding_rate_pct ?? 0).toFixed(4) + '%' },

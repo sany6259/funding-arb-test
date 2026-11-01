@@ -64,7 +64,8 @@
         "desc": "GitHub Actions → gh-pages → raw.githubusercontent.com → Vercel 的零成本实时 demo 架构",
         "tag": "部署"
       }
-    }
+    },
+    "englishFallback": "本文尚未翻译成俄语，现显示英文版本。"
   },
   "scanner": {
     "title": "套利机会",
@@ -167,7 +168,10 @@
     "walletSignOpen": "开仓（钱包签名）",
     "walletMixedMode": "混合模式：钱包腿 + 后端腿",
     "walletNoEligible": "此交易对没有支持钱包签名的交易所",
-    "venueBalance": "余额"
+    "venueBalance": "余额",
+    "marketPriceUnavailable": "无法确定市场价格以计算数量，请先扫描。",
+    "borrow": "借贷",
+    "notAvailable": "无数据"
   },
   "positions": {
     "title": "当前持仓",
@@ -240,7 +244,11 @@
     "days": "天",
     "hours": "时",
     "minutes": "分",
-    "equityCurve": "净值曲线"
+    "equityCurve": "净值曲线",
+    "recorded": "已记录",
+    "fundingSpreadAnnual": "资金费率差（年化）",
+    "mode": "模式",
+    "parallelLegs": "并行开仓"
   },
   "backtest": {
     "title": "回测参数",
@@ -281,7 +289,15 @@
     "pair": "交易对",
     "direction": "方向",
     "id": "ID",
-    "pnlUsdt": "盈亏 (USDT)"
+    "pnlUsdt": "盈亏 (USDT)",
+    "minEdge": "最小收益",
+    "maxHold": "最长持有（小时）",
+    "crossInterval": "跨周期",
+    "syncStrategy": "从策略同步",
+    "syncSuccess": "已同步策略设置",
+    "syncFailed": "同步策略设置失败",
+    "equity": "权益",
+    "openPairs": "持仓对数"
   },
   "settings": {
     "venueConfig": "交易所配置",
@@ -400,6 +416,49 @@
   "language": {
     "en": "English",
     "zh-CN": "简体中文",
-    "zh-TW": "繁體中文"
+    "zh-TW": "繁體中文",
+    "ru": "Русский"
+  },
+  "demo": {
+    "title": "🎭 演示模式",
+    "loading": "正在加载快照…",
+    "refreshed": "数据由 GitHub Actions 每小时更新，",
+    "lastScan": "上次扫描：{time}",
+    "stale": "（数据已过期，流水线可能不可用）",
+    "connecting": "正在连接 raw.githubusercontent.com…",
+    "bodyBefore": "这是只读演示，实盘交易、钱包连接及下单均已禁用。扫描表显示 CI 推送到以下分支的最新小时快照：",
+    "bodyAfter": "。",
+    "source": "查看原始快照 ↗"
+  },
+  "credentialFields": {
+    "apiKey": "API 密钥",
+    "apiSecret": "API 密钥",
+    "secretKey": "密钥",
+    "passphrase": "密码短语",
+    "mnemonic": "助记词",
+    "mnemonicPlaceholder": "24 词 BIP-39 助记词",
+    "address": "地址",
+    "network": "网络",
+    "subaccount": "子账户",
+    "walletAddress": "钱包地址",
+    "privateKey": "私钥",
+    "privateKeyPlaceholder": "私钥",
+    "accountId": "账户 ID",
+    "tradingKey": "交易密钥",
+    "apiPrivateKey": "API 私钥",
+    "accountIndex": "账户索引",
+    "l1Address": "L1 地址",
+    "numericAccountId": "数字账户 ID",
+    "numericIndex": "数字索引（或使用 L1 地址）",
+    "l1Alternative": "0x...（可替代索引）"
+  },
+  "credentialBackends": {
+    "mac": "macOS Keychain / 系统密钥管理",
+    "keyringMissing": "未安装 keyring 包",
+    "systemd": "systemd-creds (Linux TPM2)",
+    "linuxOnly": "仅限 Linux",
+    "age": "age 加密文件",
+    "ageMissing": "未安装 age 工具",
+    "plaintext": "明文 JSON（备用）"
   }
 }

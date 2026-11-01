@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, onMounted } from 'vue'
 import { NAlert, NSpin } from 'naive-ui'
+import { useI18n } from 'vue-i18n'
+
+const { t, locale } = useI18n()
 
 const props = defineProps<{
   /** CDN URL the demo is currently fetching from. */
@@ -15,7 +18,7 @@ const scanTimeHuman = computed(() => {
   if (!props.scanTime) return ''
   try {
     const d = new Date(props.scanTime)
-    return d.toLocaleString(undefined, {
+    return d.toLocaleString(locale.value, {
       year: 'numeric',
       month: '2-digit',
       day: '2-digit',
@@ -53,25 +56,23 @@ onMounted(() => {
   >
     <template #header>
       <span class="banner-title">
-        🎭 Demo Mode
+        {{ t('demo.title') }}
         <span v-if="loading" class="banner-meta">
-          — <NSpin size="small" /> loading snapshot…
+          — <NSpin size="small" /> {{ t('demo.loading') }}
         </span>
         <span v-else-if="scanTimeHuman" class="banner-meta">
-          — data refreshed hourly by GitHub Actions,
-          <strong>last scan {{ scanTimeHuman }}</strong>
-          <span v-if="stale" class="stale-flag"> (stale — pipeline may be down)</span>
+          — {{ t('demo.refreshed') }}
+          <strong>{{ t('demo.lastScan', { time: scanTimeHuman }) }}</strong>
+          <span v-if="stale" class="stale-flag">{{ t('demo.stale') }}</span>
         </span>
         <span v-else class="banner-meta">
-          — connecting to raw.githubusercontent.com…
+          — {{ t('demo.connecting') }}
         </span>
       </span>
     </template>
     <div class="banner-body">
       <span>
-        This is a read-only demo. Live trading, wallet connection, and order
-        placement are disabled. The scanner table shows the most recent hourly
-        snapshot pushed by CI to the <code>gh-pages</code> branch.
+        {{ t('demo.bodyBefore') }} <code>gh-pages</code>{{ t('demo.bodyAfter') }}
       </span>
       <a
         v-if="source"
@@ -80,7 +81,7 @@ onMounted(() => {
         rel="noreferrer noopener"
         class="source-link"
       >
-        view raw snapshot ↗
+        {{ t('demo.source') }}
       </a>
     </div>
   </NAlert>

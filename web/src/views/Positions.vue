@@ -410,7 +410,7 @@ const tableColumns = computed<DataTableColumns<PositionItem>>(() => [
       size: 'small',
       type: row.direction === 'forward' ? 'success' : 'warning',
       bordered: false,
-    }, { default: () => row.direction }),
+    }, { default: () => row.direction === 'forward' ? t('scanner.forward') : row.direction === 'reverse' ? t('scanner.reverse') : row.direction }),
   },
   {
     title: t('positions.long') + '/' + t('positions.short'),
@@ -510,7 +510,7 @@ const tableColumns = computed<DataTableColumns<PositionItem>>(() => [
         open: 'success',
         closed: 'default',
       }
-      return h(NTag, { size: 'small', type: colorMap[row.status] ?? 'default', bordered: false }, { default: () => row.status })
+      return h(NTag, { size: 'small', type: colorMap[row.status] ?? 'default', bordered: false }, { default: () => row.status === 'open' ? t('positions.openFilter') : row.status === 'closed' ? t('positions.closedFilter') : row.status })
     },
   },
   {
@@ -544,9 +544,9 @@ function renderDetail(row: PositionItem) {
 
   // Prices
   if (isPureFutures) {
-    items.push({ label: t('positions.openPrice') + ' (Long/Short)', value: `${fmtPrice(open.long)} / ${fmtPrice(open.short)}` })
+    items.push({ label: t('positions.openPrice') + ' (' + t('positions.long') + '/' + t('positions.short') + ')', value: `${fmtPrice(open.long)} / ${fmtPrice(open.short)}` })
     if (close.long !== undefined) {
-      items.push({ label: t('positions.closePrice') + ' (Long/Short)', value: `${fmtPrice(close.long)} / ${fmtPrice(close.short)}` })
+      items.push({ label: t('positions.closePrice') + ' (' + t('positions.long') + '/' + t('positions.short') + ')', value: `${fmtPrice(close.long)} / ${fmtPrice(close.short)}` })
     }
     if (row.long_qty || row.short_qty) {
       items.push({ label: t('positions.longQty') + '/' + t('positions.shortQty'), value: `${row.long_qty ?? '-'} / ${row.short_qty ?? '-'}` })
@@ -571,7 +571,7 @@ function renderDetail(row: PositionItem) {
     items.push({ label: t('positions.exitSpread'), value: fmtPct(row.close_info.close_mark_spread as number, 4) })
   }
   if (row.close_info?.open_mark_spread !== undefined) {
-    items.push({ label: t('positions.entrySpread') + ' (recorded)', value: fmtPct(row.close_info.open_mark_spread as number, 4) })
+    items.push({ label: t('positions.entrySpread') + ' (' + t('positions.recorded') + ')', value: fmtPct(row.close_info.open_mark_spread as number, 4) })
   }
 
   items.push({ label: t('positions.holdTime'), value: formatDuration(row.opened_at ?? row.open_time, row.closed_at) })
@@ -584,7 +584,7 @@ function renderDetail(row: PositionItem) {
   }
   const spread = fundingSpread(row)
   if (spread !== null) {
-    items.push({ label: t('positions.funding') + ' Spread (ann)', value: fmtPct(spread, 1), type: spread >= 0 ? 'success' : 'error' })
+    items.push({ label: t('positions.fundingSpreadAnnual'), value: fmtPct(spread, 1), type: spread >= 0 ? 'success' : 'error' })
   }
   items.push({ label: t('positions.feeEstimate'), value: fmtUsd(fees) })
   items.push({ label: t('positions.netPnl'), value: fmtUsd(npnl, true), type: (npnl ?? 0) >= 0 ? 'success' : 'error' })
@@ -597,7 +597,7 @@ function renderDetail(row: PositionItem) {
     items.push({ label: t('positions.strategy'), value: row.dry_run ? t('positions.dryRun') : t('positions.live') })
   }
   if (row.parallel_legs) {
-    items.push({ label: 'Mode', value: 'Parallel legs' })
+    items.push({ label: t('positions.mode'), value: t('positions.parallelLegs') })
   }
   if (row.closed_at) {
     items.push({ label: t('positions.closedAt'), value: formatTime(row.closed_at) })

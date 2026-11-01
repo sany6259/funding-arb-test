@@ -79,6 +79,33 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 
+const fieldLabels: Record<string, string> = {
+  "API Key": "apiKey",
+  "API Secret": "apiSecret",
+  "Secret Key": "secretKey",
+  "Passphrase": "passphrase",
+  "Mnemonic": "mnemonic",
+  "24-word BIP-39 mnemonic": "mnemonicPlaceholder",
+  "Address": "address",
+  "Network": "network",
+  "Subaccount": "subaccount",
+  "Wallet Address": "walletAddress",
+  "Private Key": "privateKey",
+  "Private key": "privateKeyPlaceholder",
+  "Account ID": "accountId",
+  "Trading Key": "tradingKey",
+  "API Private Key": "apiPrivateKey",
+  "Account Index": "accountIndex",
+  "L1 Address": "l1Address",
+  "Numeric account ID": "numericAccountId",
+  "Numeric index (or use L1 address)": "numericIndex",
+  "0x... (alternative to index)": "l1Alternative"
+}
+function localizedField(value: string): string {
+  const key = fieldLabels[value]
+  return key ? t(`credentialFields.${key}`) : value
+}
+
 const displayName = computed(() => props.schema?.name || VENUE_FALLBACK[props.venue] || props.venue)
 
 // Connected if backend creds are set (env) OR a browser wallet extension is linked.
@@ -283,14 +310,14 @@ function shortAddress(addr: string): string {
             <n-form-item
               v-for="field in allFields"
               :key="field.key"
-              :label="field.label"
+              :label="localizedField(field.label)"
               :show-require-mark="schema?.fields.some((f) => f.key === field.key)"
             >
               <n-input
                 v-if="field.type !== 'select'"
                 :value="form[field.key] ?? ''"
                 :type="field.type === 'password' ? 'password' : 'text'"
-                :placeholder="field.placeholder || field.label"
+                :placeholder="localizedField(field.placeholder || field.label)"
                 show-password-on="click"
                 @update:value="(v: string) => setField(field.key, v)"
               />
@@ -298,7 +325,7 @@ function shortAddress(addr: string): string {
                 v-else
                 :value="form[field.key] ?? ''"
                 :options="field.options?.map((o) => ({ label: o, value: o }))"
-                :placeholder="field.label"
+                :placeholder="localizedField(field.label)"
                 @update:value="(v: string) => setField(field.key, v)"
               />
             </n-form-item>

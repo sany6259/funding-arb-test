@@ -64,7 +64,8 @@
         "desc": "GitHub Actions → gh-pages → raw.githubusercontent.com → Vercel: zero-cost live demo architecture",
         "tag": "Deploy"
       }
-    }
+    },
+    "englishFallback": "This article is not yet available in Russian; the English version is shown."
   },
   "scanner": {
     "title": "Arbitrage Opportunities",
@@ -167,7 +168,10 @@
     "walletSignOpen": "Open (Wallet Sign)",
     "walletMixedMode": "Mixed mode: wallet leg + backend leg",
     "walletNoEligible": "No wallet-capable venue in this pair",
-    "venueBalance": "Balance"
+    "venueBalance": "Balance",
+    "marketPriceUnavailable": "Cannot determine market price for size calculation. Please scan first.",
+    "borrow": "Borrow",
+    "notAvailable": "N/A"
   },
   "positions": {
     "title": "Positions",
@@ -240,7 +244,11 @@
     "days": "d",
     "hours": "h",
     "minutes": "m",
-    "equityCurve": "Equity Curve"
+    "equityCurve": "Equity Curve",
+    "recorded": "recorded",
+    "fundingSpreadAnnual": "Funding Spread (annual)",
+    "mode": "Mode",
+    "parallelLegs": "Parallel legs"
   },
   "backtest": {
     "title": "Backtest Parameters",
@@ -281,7 +289,15 @@
     "pair": "Pair",
     "pnlUsdt": "PnL (USDT)",
     "id": "ID",
-    "direction": "Direction"
+    "direction": "Direction",
+    "minEdge": "Min Edge",
+    "maxHold": "Max Hold (h)",
+    "crossInterval": "Cross-Interval",
+    "syncStrategy": "Sync from Strategy",
+    "syncSuccess": "Synced from strategy settings",
+    "syncFailed": "Failed to sync strategy settings",
+    "equity": "Equity",
+    "openPairs": "Open pairs"
   },
   "settings": {
     "venueConfig": "Venue Configuration",
@@ -344,10 +360,10 @@
     "modeDryRun": "Dry Run",
     "modeLive": "Live",
     "modeLiveWarning": "Real money trading!",
-    "tabConnection": "连接",
-    "tabStrategy": "策略",
-    "tabFees": "费率",
-    "tabAdvanced": "高级",
+    "tabConnection": "Connection",
+    "tabStrategy": "Strategy",
+    "tabFees": "Fees",
+    "tabAdvanced": "Advanced",
     "connectKeplr": "Connect Keplr Wallet",
     "connectMetaMask": "Connect MetaMask",
     "orManualEntry": "Or enter keys manually",
@@ -400,6 +416,49 @@
   "language": {
     "en": "English",
     "zh-CN": "简体中文",
-    "zh-TW": "繁體中文"
+    "zh-TW": "繁體中文",
+    "ru": "Русский"
+  },
+  "demo": {
+    "title": "🎭 Demo Mode",
+    "loading": "loading snapshot…",
+    "refreshed": "data refreshed hourly by GitHub Actions,",
+    "lastScan": "last scan {time}",
+    "stale": " (stale — pipeline may be down)",
+    "connecting": "connecting to raw.githubusercontent.com…",
+    "bodyBefore": "This is a read-only demo. Live trading, wallet connection, and order placement are disabled. The scanner table shows the most recent hourly snapshot pushed by CI to the",
+    "bodyAfter": " branch.",
+    "source": "view raw snapshot ↗"
+  },
+  "credentialFields": {
+    "apiKey": "API Key",
+    "apiSecret": "API Secret",
+    "secretKey": "Secret Key",
+    "passphrase": "Passphrase",
+    "mnemonic": "Mnemonic",
+    "mnemonicPlaceholder": "24-word BIP-39 mnemonic",
+    "address": "Address",
+    "network": "Network",
+    "subaccount": "Subaccount",
+    "walletAddress": "Wallet Address",
+    "privateKey": "Private Key",
+    "privateKeyPlaceholder": "Private key",
+    "accountId": "Account ID",
+    "tradingKey": "Trading Key",
+    "apiPrivateKey": "API Private Key",
+    "accountIndex": "Account Index",
+    "l1Address": "L1 Address",
+    "numericAccountId": "Numeric account ID",
+    "numericIndex": "Numeric index (or use L1 address)",
+    "l1Alternative": "0x... (alternative to index)"
+  },
+  "credentialBackends": {
+    "mac": "macOS Keychain / System Key Management",
+    "keyringMissing": "keyring package not installed",
+    "systemd": "systemd-creds (Linux TPM2)",
+    "linuxOnly": "Linux only",
+    "age": "age encrypted file",
+    "ageMissing": "age tool not installed",
+    "plaintext": "Plaintext JSON (fallback)"
   }
 }
