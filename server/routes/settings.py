@@ -754,62 +754,14 @@ async def get_wallet_status(venue: str | None = None):
 
 @router.post("/settings/wallet/connect")
 async def connect_wallet(req: WalletConnectRequest):
-    """Connect a venue by setting its credentials as process env vars.
-
-    Session-scoped only: the credentials live in this server process's
-    environment and are NOT persisted to disk, so they are lost on restart.
-    Reconnect after a restart, or store them via ``setup_credentials.py``
-    (keyring/age) for unattended 7x24 use. This keeps secrets typed into the
-    browser off disk by default.
-    """
-    schema = _WALLET_SCHEMAS.get(req.venue)
-    if not schema:
-        return {"success": False, "error": f"Unknown venue: {req.venue}"}
-
-    # Validate required fields
-    required_keys = [f["key"] for f in schema["fields"]]
-    missing = [k for k in required_keys if not req.credentials.get(k, "").strip()]
-    if missing:
-        return {
-            "success": False,
-            "error": f"Missing required fields: {', '.join(missing)}",
-        }
-
-    # Set env vars for this session
-    all_field_keys = [f["key"] for f in schema["fields"]] + [
-        f["key"] for f in schema.get("extra_fields", [])
-    ]
-    for key in all_field_keys:
-        val = req.credentials.get(key, "").strip()
-        if val:
-            os.environ[key] = val
-
-    # Enable live flag if present
-    live_flag = schema.get("live_flag")
-    if live_flag and req.credentials.get(live_flag):
-        os.environ[live_flag] = req.credentials[live_flag]
-
-    return {"success": True, "data": {"venue": req.venue, "connected": True}}
+    """Stage A cannot attach legacy/live credentials."""
+    return {"success": False, "error": "Изменение торговых ключей отключено; используйте проверку демо-ключей."}
 
 
 @router.post("/settings/wallet/disconnect")
 async def disconnect_wallet(req: WalletDisconnectRequest):
-    """Disconnect a wallet by clearing its credentials from the session."""
-    schema = _WALLET_SCHEMAS.get(req.venue)
-    if not schema:
-        return {"success": False, "error": f"Unknown venue: {req.venue}"}
-
-    all_keys = [f["key"] for f in schema["fields"]] + [
-        f["key"] for f in schema.get("extra_fields", [])
-    ]
-    live_flag = schema.get("live_flag")
-    if live_flag:
-        all_keys.append(live_flag)
-
-    for key in all_keys:
-        os.environ.pop(key, None)
-
-    return {"success": True, "data": {"venue": req.venue, "connected": False}}
+    """Do not mutate existing process credentials during stage A."""
+    return {"success": False, "error": "Изменение торговых ключей отключено на этапе проверки демо."}
 
 
 @router.get("/settings/trading-mode")
@@ -854,10 +806,11 @@ async def get_trading_mode():
                     "live_enabled": False,
                 }
 
-    # Overall mode: live if any venue is live, else dry_run
-    overall = (
-        "live" if any(v["mode"] == "live" for v in venues_out.values()) else "dry_run"
-    )
+    # Stage A does not enable trading, even if old production credentials exist.
+    for venue in venues_out.values():
+        venue["mode"] = "dry_run"
+        venue["live_enabled"] = False
+    overall = "dry_run"
 
     return {"success": True, "data": {"mode": overall, "venues": venues_out}}
 

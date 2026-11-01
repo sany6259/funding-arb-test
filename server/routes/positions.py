@@ -362,6 +362,9 @@ async def get_position(position_id: str):
 @router.post("/positions/open")
 async def open_position(req: OpenPositionRequest):
     """Open a new hedge position (pure futures, cash-and-carry, or unified C&C)."""
+    from server.routes.demo_connections import current_mode
+    if current_mode() != "simulation" or req.dry_run is not True:
+        return {"success": False, "error": "Ордерная торговля отключена на этапе проверки демо."}
     strategy = req.strategy
     direction = str(req.direction or "forward").lower()
     if direction not in ("forward", "reverse"):
@@ -471,6 +474,9 @@ async def close_position(position_id: str, req: ClosePositionRequest | None = No
     if target.get("status") == "closed":
         return {"success": False, "error": "Position already closed"}
 
+    from server.routes.demo_connections import current_mode
+    if current_mode() != "simulation" or target.get("dry_run") is not True:
+        return {"success": False, "error": "Закрытие реальных и демо-позиций отключено."}
     kind = _position_kind(position_id, positions)
     # Close in the same mode the position was opened in. Never escalate a
     # dry-run (paper) position to a live close based on a global env flag —
@@ -490,7 +496,7 @@ async def close_position(position_id: str, req: ClosePositionRequest | None = No
         elif _close_fn is not None:
             result = await loop.run_in_executor(
                 None,
-                lambda: _close_fn(position_id),
+                lambda: _close_fn(position_id, dry_run=True),
             )
         else:
             return {
