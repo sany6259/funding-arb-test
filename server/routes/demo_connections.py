@@ -1,4 +1,4 @@
-"""Stage A: isolated, stateless demo-account checks. No order endpoints."""
+"""Isolated read-only demo-account checks. No order endpoints."""
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
-import threading
+import os
 import time
 import urllib.request
 import urllib.parse
@@ -17,10 +17,9 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from core import demo_credentials, execution_mode as shared_mode
 
 router = APIRouter(tags=["demo-readonly"])
-_lock = threading.RLock()
-_mode = "simulation"
 
 # Only these exact HTTPS GET endpoints may receive demo credentials.
 _ENDPOINTS = {
@@ -31,31 +30,35 @@ _ENDPOINTS = {
 
 
 def current_mode() -> str:
-    with _lock:
-        return _mode
+    return shared_mode.current_mode()
 
 
 @router.get("/execution-mode")
 async def execution_mode():
-    mode = current_mode()
-    return {"mode": mode, "environment": "demo" if mode == "demo" else "none",
-            "orders_enabled": False, "live_supported": False}
+    try:
+        mode = current_mode()
+        return {"mode": mode, "environment": "demo" if mode == "demo" else "none",
+                "orders_enabled": False, "live_supported": False}
+    except Exception:
+        return JSONResponse(status_code=503, content={"error": "Состояние режима недоступно; ордера отключены."})
 
 
 @router.post("/execution-mode")
 async def set_execution_mode(request: Request):
-    global _mode
+    if not _local_request(request):
+        return JSONResponse(status_code=403, content={"error": "Доступ только с локального компьютера."})
     try:
         if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
             raise ValueError("JSON required")
         payload = await request.json()
         value = payload.get("mode") if isinstance(payload, dict) else None
-    except Exception:
-        value = None
-    if value not in ("simulation", "demo"):
+        if value not in ("simulation", "demo"):
+            raise ValueError("invalid mode")
+        shared_mode.set_mode(value)
+    except ValueError:
         return JSONResponse(status_code=400, content={"error": "Режим недоступен; реальная торговля отключена."})
-    with _lock:
-        _mode = value
+    except Exception:
+        return JSONResponse(status_code=503, content={"error": "Состояние режима недоступно; ордера отключены."})
     return {"mode": value, "environment": "demo" if value == "demo" else "none", "orders_enabled": False}
 
 
@@ -69,37 +72,38 @@ def _balance(venue: str, response: Any) -> str | None:
         raise ValueError("Unexpected response")
     if venue == "bybit":
         if response.get("retCode") != 0:
-            raise ValueError("Authentication failed")
+            raise ValueError("Authentication or exchange error")
         accounts = response.get("result", {}).get("list")
-        if not isinstance(accounts, list) or not accounts:
+        if not isinstance(accounts, list) or not accounts or not isinstance(accounts[0], dict):
             raise ValueError("Missing account")
-        entries = accounts[0].get("coin")
-        field, asset = "walletBalance", "coin"
+        # UTA reports account-wide availability in USD, not per-coin USDT.
+        raw = accounts[0].get("totalAvailableBalance")
     elif venue == "okx":
         if response.get("code") != "0":
-            raise ValueError("Authentication failed")
+            raise ValueError("Authentication or exchange error")
         accounts = response.get("data")
-        if not isinstance(accounts, list) or not accounts:
+        if not isinstance(accounts, list) or not accounts or not isinstance(accounts[0], dict):
             raise ValueError("Missing account")
         entries = accounts[0].get("details")
-        field, asset = "eq", "ccy"
+        if not isinstance(entries, list):
+            raise ValueError("Missing balance")
+        raw = next((entry.get("availBal") for entry in entries if isinstance(entry, dict) and entry.get("ccy") == "USDT"), None)
     else:
         if response.get("code") != "00000":
-            raise ValueError("Authentication failed")
+            raise ValueError("Authentication or exchange error")
         entries = response.get("data")
-        field, asset = "available", "coin"
-    if not isinstance(entries, list):
-        raise ValueError("Missing balance")
-    for entry in entries:
-        if isinstance(entry, dict) and entry.get(asset) == "USDT":
-            try:
-                amount = Decimal(str(entry[field]))
-            except (KeyError, ValueError, InvalidOperation):
-                raise ValueError("Invalid balance") from None
-            if not amount.is_finite() or amount < 0:
-                raise ValueError("Invalid balance")
-            return format(amount, "f")
-    return None  # An absent asset is not a verified zero balance.
+        if not isinstance(entries, list):
+            raise ValueError("Missing balance")
+        raw = next((entry.get("available") for entry in entries if isinstance(entry, dict) and entry.get("coin") == "USDT"), None)
+    if raw is None or raw == "":
+        return None
+    try:
+        amount = Decimal(str(raw))
+    except (ValueError, InvalidOperation):
+        raise ValueError("Invalid balance") from None
+    if not amount.is_finite() or amount < 0 or amount.adjusted() > 30 or amount.adjusted() < -30:
+        raise ValueError("Invalid balance")
+    return format(amount, "f")
 
 
 def _check(venue: str, key: str, secret: str, passphrase: str) -> str | None:
@@ -149,31 +153,93 @@ def _local_request(request: Request) -> bool:
     return True
 
 
+def _failure(message: str, status: int = 400):
+    return JSONResponse(status_code=status, content={"error": message})
+
+
+@router.get("/demo/credentials")
+async def credential_status(request: Request):
+    if not _local_request(request):
+        return _failure("Доступ только с локального компьютера.", 403)
+    try:
+        configured = {venue: demo_credentials.load(venue, 'demo') is not None for venue in _ENDPOINTS}
+        return {"environment": "demo", "configured": configured}
+    except Exception:
+        return _failure("Защищённое хранилище недоступно.", 503)
+
+
+async def _demo_payload(request: Request):
+    if not _local_request(request):
+        return None, _failure("Доступ только с локального компьютера.", 403)
+    try:
+        if current_mode() != 'demo':
+            return None, _failure("Сначала выберите демо-режим.", 409)
+        if request.headers.get('content-type', '').split(';', 1)[0].strip().lower() != 'application/json':
+            raise ValueError('JSON required')
+        payload = await request.json()
+        if not isinstance(payload, dict) or payload.get('venue') not in _ENDPOINTS or payload.get('environment') != 'demo':
+            raise ValueError('Invalid environment')
+        return payload, None
+    except RuntimeError:
+        return None, _failure("Состояние режима недоступно; ордера отключены.", 503)
+    except Exception:
+        return None, _failure("Некорректный запрос.")
+
+
+@router.post("/demo/credentials")
+async def save_credentials(request: Request):
+    payload, error = await _demo_payload(request)
+    if error:
+        return error
+    try:
+        venue = payload['venue']
+        key, secret, passphrase = payload.get('api_key'), payload.get('api_secret'), payload.get('passphrase', '')
+        if not all(isinstance(x, str) and 0 < len(x) <= 512 and '\r' not in x and '\n' not in x for x in (key, secret)):
+            raise ValueError('Invalid credentials')
+        if not isinstance(passphrase, str) or len(passphrase) > 512 or '\r' in passphrase or '\n' in passphrase or (venue != 'bybit' and not passphrase):
+            raise ValueError('Invalid passphrase')
+        # Reject known live/testnet API keys; exchange authenticates the remaining key as demo.
+        live_key_names = {'bybit': ('BYBIT_API_KEY', 'BYBIT_TESTNET_API_KEY'),
+                          'okx': ('OKX_API_KEY',), 'bitget': ('BITGET_API_KEY',)}
+        if any(os.environ.get(name) and hmac.compare_digest(key, os.environ[name]) for name in live_key_names[venue]):
+            raise ValueError('Key already assigned to another environment')
+        await asyncio.to_thread(demo_credentials.save, venue, 'demo', key, secret, passphrase)
+        return {"venue": venue, "environment": "demo", "configured": True, "connected": False}
+    except ValueError:
+        return _failure("Проверьте поля и используйте отдельный демоключ.")
+    except Exception:
+        return _failure("Не удалось сохранить ключ в защищённом хранилище.", 503)
+
+
+@router.post("/demo/credentials/delete")
+async def delete_credentials(request: Request):
+    payload, error = await _demo_payload(request)
+    if error:
+        return error
+    try:
+        await asyncio.to_thread(demo_credentials.delete, payload['venue'], 'demo')
+        return {"venue": payload['venue'], "environment": "demo", "configured": False}
+    except Exception:
+        return _failure("Не удалось удалить ключ из защищённого хранилища.", 503)
+
+
 @router.post("/demo/check")
 async def check_demo(request: Request):
-    if not _local_request(request):
-        return JSONResponse(status_code=403, content={"error": "Проверка доступна только с локального компьютера."})
-    if current_mode() != "demo":
-        return JSONResponse(status_code=409, content={"error": "Сначала выберите демо-режим."})
+    payload, error = await _demo_payload(request)
+    if error:
+        return error
     try:
-        if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
-            raise ValueError("JSON required")
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise ValueError("Invalid request")
-        venue, environment = payload.get("venue"), payload.get("environment")
-        key, secret, passphrase = payload.get("api_key"), payload.get("api_secret"), payload.get("passphrase", "")
-        if venue not in _ENDPOINTS or environment != "demo":
-            raise ValueError("Unsupported environment")
-        if not all(isinstance(x, str) and 0 < len(x) <= 512 and "\r" not in x and "\n" not in x for x in (key, secret)):
-            raise ValueError("Missing credentials")
-        if not isinstance(passphrase, str) or len(passphrase) > 512 or "\r" in passphrase or "\n" in passphrase or (venue != "bybit" and not passphrase):
-            raise ValueError("Missing passphrase")
-        balance = await asyncio.to_thread(_check, venue, key, secret, passphrase)
-        if current_mode() != "demo":
-            return JSONResponse(status_code=409, content={"error": "Режим изменился; повторите проверку."})
+        venue = payload['venue']
+        creds = await asyncio.to_thread(demo_credentials.load, venue, 'demo')
+        if creds is None:
+            return _failure("Сначала сохраните демоключ.", 409)
+        # The remote adapter has no credential fallback and fixes the demo endpoint and headers.
+        balance = await asyncio.to_thread(_check, venue, creds['key'], creds['secret'], creds['passphrase'])
+        if current_mode() != 'demo':
+            return _failure("Режим изменился; повторите проверку.", 409)
         return {"venue": venue, "environment": "demo", "connected": True,
-                "credentials": "••••", "balance": {"asset": "USDT", "amount": balance}, "orders_enabled": False}
+                "credentials": "••••", "balance": {"asset": "USD" if venue == "bybit" else "USDT", "amount": balance,
+                    "account_type": {"bybit": "Unified Account", "okx": "Trading Account", "bitget": "Spot Account"}[venue]},
+                "orders_enabled": False}
     except Exception:
-        # No remote messages, request body or secret values in logs or response.
-        return JSONResponse(status_code=400, content={"error": "Не удалось проверить демо-доступ или баланс."})
+        return _failure("Проверка не пройдена: ошибка авторизации, баланса или связи с биржей.")

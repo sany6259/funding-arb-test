@@ -79,6 +79,9 @@ def _sign(ts: str, method: str, path: str, body: str) -> str:
 def _api_call(
     method: str, path: str, params: Optional[dict] = None, body: Optional[dict] = None
 ) -> dict:
+    if method.upper() != "GET":
+        from core.execution_mode import forbid_orders
+        forbid_orders()
     from urllib.parse import urlencode
 
     # Credential validation: fail immediately on missing credentials; never send private requests with empty credentials (avoids silent failures / account-state misjudgment)

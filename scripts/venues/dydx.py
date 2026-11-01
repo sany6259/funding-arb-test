@@ -206,6 +206,8 @@ def _submit_market_order(
     Returns {order_id, tx_hash, latency_ms} on success.
     Raises on any failure so the caller can set record["status"] = "failed".
     """
+    from core.execution_mode import forbid_orders
+    forbid_orders()
     assert _market_cls is not None
     assert _order_flags_cls is not None
     assert _order_type_cls is not None
@@ -256,6 +258,7 @@ def _submit_market_order(
 
     # Sign and broadcast
     t0 = time.time()
+    forbid_orders()
     result = _run(node.place_order(wallet, new_order))
     latency = int((time.time() - t0) * 1000)
 

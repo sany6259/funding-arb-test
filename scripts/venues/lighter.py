@@ -234,6 +234,8 @@ class LighterVenue:
         is_ask: bool,
         reduce_only: bool,
     ) -> tuple[Any, Any, str | None]:
+        from core.execution_mode import forbid_orders
+        forbid_orders()
         client = self._make_signer()
         try:
             tx, resp, err = await client.create_market_order(

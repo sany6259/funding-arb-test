@@ -103,6 +103,10 @@ def test_invalid_testnet_flag_fails_before_credentials(monkeypatch, enabled):
 
 
 def test_testnet_only_routing_and_credentials(monkeypatch):
+    # Exercise testnet routing with a mocked transport; the stage-A guard itself
+    # is covered separately and prevents all real order submissions.
+    from core import execution_mode
+    monkeypatch.setattr(execution_mode, "forbid_orders", lambda: None)
     import json
     from backtest.funding_providers import BybitFundingProvider
     from venues import get_venue
@@ -292,6 +296,8 @@ def test_public_market_funding_and_depth_stay_on_testnet(monkeypatch):
 
 
 def test_mocked_testnet_two_leg_orders_use_testnet_only(monkeypatch, tmp_path):
+    from core import execution_mode
+    monkeypatch.setattr(execution_mode, "forbid_orders", lambda: None)
     import json
     import urllib.parse
     monkeypatch.setenv("BYBIT_REQUIRE_TESTNET", "1")

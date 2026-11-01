@@ -453,6 +453,8 @@ class HyperliquidVenue:
                 else:
                     limit_px = mid * (1 - slippage_dec)
 
+                from core.execution_mode import forbid_orders
+                forbid_orders()
                 result = exchange.order(
                     coin=coin,
                     is_buy=is_buy,

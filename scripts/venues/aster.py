@@ -41,6 +41,9 @@ def _get_secret() -> str:
 def _api_call(
     method: str, path: str, params: Optional[dict] = None, signed: bool = False
 ) -> Any:
+    if method.upper() != "GET":
+        from core.execution_mode import forbid_orders
+        forbid_orders()
     """Binance-style fapi call. GET retried, POST not (avoid duplicate orders)."""
     import json as _json
     import urllib.request

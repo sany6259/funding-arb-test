@@ -124,6 +124,9 @@ def _api_call(
         raise ValueError("Invalid Bybit API path")
     if testnet and method != "GET" and os.environ.get("BYBIT_TESTNET_ALLOW_ORDERS") != "1":
         raise RuntimeError("Bybit testnet writes require explicit BYBIT_TESTNET_ALLOW_ORDERS=1")
+    if method.upper() != "GET":
+        from core.execution_mode import forbid_orders
+        forbid_orders()
     if testnet:
         key = os.environ.get("BYBIT_TESTNET_API_KEY") or ""
         secret = os.environ.get("BYBIT_TESTNET_SECRET_KEY") or ""

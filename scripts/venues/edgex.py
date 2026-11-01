@@ -258,6 +258,8 @@ class EdgexVenue:
     async def _submit_limit_order(
         self, contract_id: str, size: str, price: str, side: Any
     ) -> Any:
+        from core.execution_mode import forbid_orders
+        forbid_orders()
         client = self._make_client()
         try:
             return await client.create_limit_order(

@@ -84,6 +84,9 @@ def _sign(query: str) -> str:
 def _api_call(
     method: str, path: str, params: Optional[dict] = None, signed: bool = False
 ) -> Any:
+    if method.upper() != "GET":
+        from core.execution_mode import forbid_orders
+        forbid_orders()
     base_params = dict(params or {})
     if signed:
         # Credential validation: fail immediately on missing credentials; never send private requests with empty credentials
