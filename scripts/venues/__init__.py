@@ -55,6 +55,9 @@ def supported_venues() -> list[str]:
 def get_venue(cfg: dict[str, Any]) -> CexVenue:
     venue_cfg = resolve_venue_config(cfg)
     vtype = str(venue_cfg.get("type", "bitget")).strip().lower()
+    from venues.bybit import _testnet_only
+    if _testnet_only() and vtype != "bybit":
+        raise RuntimeError("Testnet-only process permits Bybit venue only")
     if vtype in _LAZY_VENUES:
         _lazy_load(vtype)
     cls = _REGISTRY.get(vtype)

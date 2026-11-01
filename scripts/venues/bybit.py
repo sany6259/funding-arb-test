@@ -10,9 +10,12 @@ import os
 import random
 import sys
 import time
+from decimal import Decimal
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import requests
 from typing import Any, Optional
 
 from core.config import resolve_timeframes
@@ -25,6 +28,38 @@ from venues.http_util import (
 )
 
 BASE = "https://api.bybit.com"
+TESTNET_BASE = "https://api-testnet.bybit.com"
+
+
+def _testnet_only() -> bool:
+    value = os.environ.get("BYBIT_REQUIRE_TESTNET")
+    if value is None:
+        return False
+    if value != "1":
+        raise RuntimeError("BYBIT_REQUIRE_TESTNET must be exactly 1 or unset")
+    return True
+
+
+def _base_url() -> str:
+    return TESTNET_BASE if _testnet_only() else BASE
+
+
+class _RejectRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RuntimeError("Bybit testnet redirect rejected")
+
+
+def _public_get(url: str, *, timeout: int = 8) -> Any:
+    if not _testnet_only():
+        return http_get_json(url, timeout=timeout)
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.netloc != "api-testnet.bybit.com":
+        raise RuntimeError("Testnet-only public request rejected")
+    response = requests.get(url, timeout=timeout, allow_redirects=False)
+    if response.status_code != 200:
+        raise RuntimeError(f"Unexpected Bybit testnet response: {response.status_code}")
+    return response.json()
+
 CONFIG_PATH = credentials_file()
 _symbol_rules_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _futures_rules_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -62,11 +97,15 @@ def _ensure_env() -> None:
 
 
 def _get_key() -> str:
+    if _testnet_only():
+        return os.environ.get("BYBIT_TESTNET_API_KEY") or ""
     _ensure_env()
     return os.environ.get("BYBIT_API_KEY") or ""
 
 
 def _get_secret() -> str:
+    if _testnet_only():
+        return os.environ.get("BYBIT_TESTNET_SECRET_KEY") or ""
     _ensure_env()
     return os.environ.get("BYBIT_SECRET_KEY") or ""
 
@@ -80,8 +119,19 @@ def _sign(payload: str) -> str:
 def _api_call(
     method: str, path: str, params: Optional[dict] = None, body: Optional[dict] = None
 ) -> dict:
-    key, secret = _get_key(), _get_secret()
+    testnet = _testnet_only()
+    if not path.startswith("/v5/") or "?" in path or "#" in path:
+        raise ValueError("Invalid Bybit API path")
+    if testnet and method != "GET" and os.environ.get("BYBIT_TESTNET_ALLOW_ORDERS") != "1":
+        raise RuntimeError("Bybit testnet writes require explicit BYBIT_TESTNET_ALLOW_ORDERS=1")
+    if testnet:
+        key = os.environ.get("BYBIT_TESTNET_API_KEY") or ""
+        secret = os.environ.get("BYBIT_TESTNET_SECRET_KEY") or ""
+    else:
+        key, secret = _get_key(), _get_secret()
     if not (key and secret):
+        if testnet:
+            raise RuntimeError("Bybit testnet credentials missing: set BYBIT_TESTNET_API_KEY and BYBIT_TESTNET_SECRET_KEY")
         raise RuntimeError(
             "Bybit API credentials missing: please set BYBIT_API_KEY / BYBIT_SECRET_KEY, "
             "or configure them in ~/.funding-arb/credentials.json under env."
@@ -99,7 +149,7 @@ def _api_call(
     full_path = path + ("?" + query if query else "")
 
     prehash = ts + key + recv_window + (query if method == "GET" else body_str)
-    sig = _sign(prehash)
+    sig = hmac.new(secret.encode(), prehash.encode(), hashlib.sha256).hexdigest()
 
     headers = {
         "X-BAPI-API-KEY": key,
@@ -112,12 +162,12 @@ def _api_call(
     retries = 3 if method == "GET" else 1
     last_err: Optional[Exception] = None
     for attempt in range(retries):
-        url = BASE + full_path
+        url = (TESTNET_BASE if testnet else BASE) + full_path
         req = urllib.request.Request(url, headers=headers, method=method)
         if body_str:
             req.data = body_str.encode()
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with (urllib.request.build_opener(_RejectRedirect()).open(req, timeout=15) if testnet else urllib.request.urlopen(req, timeout=15)) as resp:
                 data = json.loads(resp.read().decode())
             if data.get("retCode") != 0:
                 raise RuntimeError(
@@ -137,9 +187,9 @@ class BybitSpotVenue:
     venue_id = "bybit"
 
     def get_ticker(self, pair: str) -> float:
-        url = f"{BASE}/v5/market/tickers?category=spot&symbol={pair}"
+        url = f"{_base_url()}/v5/market/tickers?category=spot&symbol={pair}"
         try:
-            data = http_get_json(url)
+            data = _public_get(url)
             return float(
                 data.get("result", {}).get("list", [{}])[0].get("lastPrice", 0)
             )
@@ -148,9 +198,9 @@ class BybitSpotVenue:
 
     def get_futures_ticker(self, pair: str) -> float:
         """USDT perpetual futures last price. pair format e.g. BTCUSDT."""
-        url = f"{BASE}/v5/market/tickers?category=linear&symbol={pair}"
+        url = f"{_base_url()}/v5/market/tickers?category=linear&symbol={pair}"
         try:
-            data = http_get_json(url)
+            data = _public_get(url)
             return float(
                 data.get("result", {}).get("list", [{}])[0].get("lastPrice", 0)
             )
@@ -164,7 +214,7 @@ class BybitSpotVenue:
         if _spot_ticker_prices and (now - _spot_ticker_loaded_at) < cache_sec:
             return dict(_spot_ticker_prices)
         try:
-            data = http_get_json(f"{BASE}/v5/market/tickers?category=spot")
+            data = _public_get(f"{_base_url()}/v5/market/tickers?category=spot")
             _spot_ticker_prices = {
                 str(r.get("symbol", "")).upper(): float(r.get("lastPrice", 0) or 0)
                 for r in data.get("result", {}).get("list", [])
@@ -182,7 +232,7 @@ class BybitSpotVenue:
         if _futures_ticker_prices and (now - _futures_ticker_loaded_at) < cache_sec:
             return dict(_futures_ticker_prices)
         try:
-            data = http_get_json(f"{BASE}/v5/market/tickers?category=linear")
+            data = _public_get(f"{_base_url()}/v5/market/tickers?category=linear")
             _futures_ticker_prices = {
                 str(r.get("symbol", "")).upper(): float(r.get("lastPrice", 0) or 0)
                 for r in data.get("result", {}).get("list", [])
@@ -198,9 +248,9 @@ class BybitSpotVenue:
     ) -> list:
         interval = KLINE_INTERVALS.get(granularity, "D")
         limit = min(limit, 1000)
-        url = f"{BASE}/v5/market/kline?category=spot&symbol={pair}&interval={interval}&limit={limit}"
+        url = f"{_base_url()}/v5/market/kline?category=spot&symbol={pair}&interval={interval}&limit={limit}"
         try:
-            data = http_get_json(url)
+            data = _public_get(url)
             return list(reversed(data.get("result", {}).get("list", [])))
         except Exception:
             return []
@@ -212,9 +262,9 @@ class BybitSpotVenue:
         cached = _symbol_rules_cache.get(pair)
         if cached and (now - cached[0]) < cache_sec:
             return dict(cached[1])
-        url = f"{BASE}/v5/market/instruments-info?category=spot&symbol={pair}"
+        url = f"{_base_url()}/v5/market/instruments-info?category=spot&symbol={pair}"
         try:
-            payload = http_get_json(url)
+            payload = _public_get(url)
         except Exception:
             return dict(cached[1]) if cached else None
         rows = payload.get("result", {}).get("list", [])
@@ -263,9 +313,9 @@ class BybitSpotVenue:
         cached = _futures_rules_cache.get(pair)
         if cached and (now - cached[0]) < cache_sec:
             return dict(cached[1])
-        url = f"{BASE}/v5/market/instruments-info?category=linear&symbol={pair}"
+        url = f"{_base_url()}/v5/market/instruments-info?category=linear&symbol={pair}"
         try:
-            payload = http_get_json(url)
+            payload = _public_get(url)
         except Exception:
             return dict(cached[1]) if cached else None
         rows = payload.get("result", {}).get("list", [])
@@ -431,6 +481,9 @@ class BybitSpotVenue:
         return out
 
     def initialize_futures_symbol(self, pair: str) -> None:
+        # Do not change account-wide position or margin settings in testnet.
+        if _testnet_only():
+            return
         if pair in _initialized_symbols:
             return
         try:
@@ -554,6 +607,51 @@ class BybitSpotVenue:
             print(f"bybit margin repay {coin} failed: {e}", file=sys.stderr)
             return False
 
+    def _place_confirmed_order(
+        self, body: dict[str, Any], ref_price: float, expected_qty: str | None
+    ) -> tuple[bool, dict[str, Any]]:
+        """Accept only confirmed terminal fills; ambiguous outcomes require reconciliation."""
+        submitted_at = time.time()
+        link_id = body["orderLinkId"]
+        order_id = None
+        try:
+            response = _api_call("POST", "/v5/order/create", body=body)
+            order_id = response.get("result", {}).get("orderId")
+            if not order_id:
+                raise RuntimeError("Order acknowledgement has no order ID")
+            time.sleep(0.3)
+            detail = _api_call("GET", "/v5/order/realtime", params={
+                "category": body["category"], "orderId": order_id,
+            })
+            rows = detail.get("result", {}).get("list", [])
+            if not rows:
+                raise RuntimeError("Order status unavailable")
+            order = rows[0]
+            status = str(order.get("orderStatus") or "")
+            qty = Decimal(str(order.get("cumExecQty") or "0"))
+            price = Decimal(str(order.get("avgPrice") or "0"))
+            if not qty.is_finite() or not price.is_finite() or qty < 0 or price < 0:
+                raise ValueError("Invalid execution quantities")
+            info = {"order_id": order_id, "order_link_id": link_id,
+                    "order_status": status, "exec_qty": float(qty),
+                    "exec_price": float(price), "ref_price": ref_price}
+            if status in {"Rejected", "Cancelled", "Deactivated"} and qty == 0:
+                return False, {**info, "outcome": "rejected", "error": f"Order {status}"}
+            if status != "Filled" or qty <= 0 or price <= 0 or (
+                expected_qty is not None and qty != Decimal(expected_qty)
+            ):
+                return False, {**info, "outcome": "reconcile_required",
+                               "error": "Order not confirmed fully filled; reconcile manually"}
+            filled_at = time.time()
+            return True, {**info, "exec_quote_usd": float(qty * price),
+                          "slippage": round((float(price) - ref_price) / ref_price, 6) if ref_price else None,
+                          "submit_ts": round(submitted_at, 3), "fill_ts": round(filled_at, 3),
+                          "latency_ms": round((filled_at - submitted_at) * 1000)}
+        except Exception as exc:
+            return False, {"order_id": order_id, "order_link_id": link_id,
+                           "outcome": "reconcile_required",
+                           "error": f"Order outcome unknown; reconcile manually: {exc}"}
+
     def place_margin_order(
         self,
         pair: str,
@@ -567,6 +665,8 @@ class BybitSpotVenue:
         sell: insufficient balance auto-borrows and sells; buy: bought coins auto-offset liabilities.
         Both sides measured in base quantity (buy uses marketUnit=baseCoin).
         """
+        if _testnet_only():
+            return False, {"outcome": "rejected", "error": "Margin orders are outside the testnet scenario"}
         client_oid = f"qmgn{int(time.time())}{random.randint(0, 9999)}"
         sz = f"{amount_base:.{quantity_precision}f}".rstrip("0").rstrip(".")
         body: dict[str, Any] = {
@@ -615,179 +715,31 @@ class BybitSpotVenue:
         except Exception as e:
             return False, {"error": str(e)}
 
-    def place_buy(
-        self,
-        pair: str,
-        amount_usdt: float,
-        quote_precision: int = 2,
-        ref_price: float = 0.0,
-    ) -> tuple[bool, dict[str, Any]]:
-        client_oid = f"qbuy{int(time.time())}{random.randint(0, 9999)}"
-        submit_ts = time.time()
-        try:
-            result = _api_call(
-                "POST",
-                "/v5/order/create",
-                body={
-                    "category": "spot",
-                    "symbol": pair,
-                    "side": "Buy",
-                    "orderType": "Market",
-                    "marketUnit": "quoteCoin",
-                    "qty": f"{amount_usdt:.{quote_precision}f}",
-                    "orderLinkId": client_oid,
-                },
-            )
-            fill_ts = time.time()
-            order_id = result.get("result", {}).get("orderId", "?")
-            time.sleep(0.3)
-            detail = _api_call(
-                "GET",
-                "/v5/order/realtime",
-                params={"category": "spot", "orderId": order_id},
-            )
-            od = detail.get("result", {}).get("list", [{}])[0]
-            exec_price = float(od.get("avgPrice", 0) or ref_price)
-            exec_qty = float(od.get("cumExecQty", 0))
-            exec_quote = float(od.get("cumExecValue", amount_usdt))
-            slippage = (
-                round((exec_price - ref_price) / ref_price, 6)
-                if ref_price and exec_price
-                else None
-            )
-            return True, {
-                "order_id": order_id,
-                "exec_price": exec_price,
-                "exec_qty": exec_qty,
-                "exec_quote_usd": exec_quote,
-                "ref_price": ref_price,
-                "slippage": slippage,
-                "submit_ts": round(submit_ts, 3),
-                "fill_ts": round(fill_ts, 3),
-                "latency_ms": round((fill_ts - submit_ts) * 1000),
-                "order_status": od.get("orderStatus", ""),
-            }
-        except Exception as e:
-            return False, {"error": str(e)}
+    def place_buy(self, pair: str, amount_usdt: float, quote_precision: int = 2,
+                  ref_price: float = 0.0) -> tuple[bool, dict[str, Any]]:
+        body = {"category": "spot", "symbol": pair, "side": "Buy", "orderType": "Market",
+                "marketUnit": "quoteCoin", "qty": f"{amount_usdt:.{quote_precision}f}",
+                "orderLinkId": f"qbuy{int(time.time())}{random.randint(0, 9999)}"}
+        return self._place_confirmed_order(body, ref_price, None)
 
-    def place_sell(
-        self,
-        pair: str,
-        amount_base: float,
-        quantity_precision: int = 6,
-        ref_price: float = 0.0,
-    ) -> tuple[bool, dict[str, Any]]:
-        client_oid = f"qsell{int(time.time())}{random.randint(0, 9999)}"
+    def place_sell(self, pair: str, amount_base: float, quantity_precision: int = 6,
+                   ref_price: float = 0.0) -> tuple[bool, dict[str, Any]]:
         sz = f"{amount_base:.{quantity_precision}f}".rstrip("0").rstrip(".")
-        submit_ts = time.time()
-        try:
-            result = _api_call(
-                "POST",
-                "/v5/order/create",
-                body={
-                    "category": "spot",
-                    "symbol": pair,
-                    "side": "Sell",
-                    "orderType": "Market",
-                    "qty": sz,
-                    "orderLinkId": client_oid,
-                },
-            )
-            fill_ts = time.time()
-            order_id = result.get("result", {}).get("orderId", "?")
-            time.sleep(0.3)
-            detail = _api_call(
-                "GET",
-                "/v5/order/realtime",
-                params={"category": "spot", "orderId": order_id},
-            )
-            od = detail.get("result", {}).get("list", [{}])[0]
-            exec_price = float(od.get("avgPrice", 0) or ref_price)
-            exec_qty = float(od.get("cumExecQty", 0) or amount_base)
-            exec_quote = exec_qty * exec_price
-            slippage = (
-                round((exec_price - ref_price) / ref_price, 6)
-                if ref_price and exec_price
-                else None
-            )
-            return True, {
-                "order_id": order_id,
-                "exec_price": exec_price,
-                "exec_qty": exec_qty,
-                "exec_quote_usd": exec_quote,
-                "ref_price": ref_price,
-                "slippage": slippage,
-                "submit_ts": round(submit_ts, 3),
-                "fill_ts": round(fill_ts, 3),
-                "latency_ms": round((fill_ts - submit_ts) * 1000),
-                "order_status": od.get("orderStatus", ""),
-            }
-        except Exception as e:
-            return False, {"error": str(e)}
+        body = {"category": "spot", "symbol": pair, "side": "Sell", "orderType": "Market",
+                "qty": sz, "orderLinkId": f"qsell{int(time.time())}{random.randint(0, 9999)}"}
+        return self._place_confirmed_order(body, ref_price, sz)
 
-    def place_futures_order(
-        self,
-        pair: str,
-        side: str,
-        amount_base: float,
-        quantity_precision: int = 3,
-        ref_price: float = 0.0,
-    ) -> tuple[bool, dict[str, Any]]:
-        bybit_side = "Buy" if side in ("open_long", "close_short") else "Sell"
-        client_oid = f"qfut{int(time.time())}{random.randint(0, 9999)}"
+    def place_futures_order(self, pair: str, side: str, amount_base: float,
+                            quantity_precision: int = 3, ref_price: float = 0.0) -> tuple[bool, dict[str, Any]]:
         sz = f"{amount_base:.{quantity_precision}f}".rstrip("0").rstrip(".")
-        submit_ts = time.time()
-
         self.initialize_futures_symbol(pair)
-
-        try:
-            result = _api_call(
-                "POST",
-                "/v5/order/create",
-                body={
-                    "category": "linear",
-                    "symbol": pair,
-                    "side": bybit_side,
-                    "orderType": "Market",
-                    "qty": sz,
-                    "orderLinkId": client_oid,
-                },
-            )
-            fill_ts = time.time()
-            order_id = result.get("result", {}).get("orderId", "?")
-
-            exec_price = ref_price
-            try:
-                time.sleep(0.5)
-                detail = _api_call(
-                    "GET",
-                    "/v5/order/realtime",
-                    params={"category": "linear", "orderId": order_id},
-                )
-                od = detail.get("result", {}).get("list", [{}])[0]
-                exec_price = float(od.get("avgPrice", 0) or ref_price)
-            except Exception:
-                pass
-
-            slippage = (
-                round((exec_price - ref_price) / ref_price, 6)
-                if ref_price and exec_price
-                else None
-            )
-            return True, {
-                "order_id": order_id,
-                "exec_price": exec_price,
-                "exec_qty": amount_base,
-                "exec_quote_usd": amount_base * exec_price,
-                "ref_price": ref_price,
-                "slippage": slippage,
-                "submit_ts": round(submit_ts, 3),
-                "fill_ts": round(fill_ts, 3),
-                "latency_ms": round((fill_ts - submit_ts) * 1000),
-                "order_status": "filled",
-            }
-        except Exception as e:
-            return False, {"error": str(e)}
+        body = {"category": "linear", "symbol": pair,
+                "side": "Buy" if side in ("open_long", "close_short") else "Sell",
+                "orderType": "Market", "qty": sz,
+                "orderLinkId": f"qfut{int(time.time())}{random.randint(0, 9999)}"}
+        if side in ("close_short", "close_long"):
+            body["reduceOnly"] = True
+        return self._place_confirmed_order(body, ref_price, sz)
 
     def execute_trades(
         self,
@@ -871,7 +823,8 @@ class BybitSpotVenue:
                     }
                 )
             else:
-                record["order_id"] = None
+                record.update(detail)
+                record["status"] = detail.get("outcome", "failed")
                 record["error"] = detail.get("error", str(detail))
             results.append(record)
         return results

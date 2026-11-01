@@ -76,11 +76,9 @@ def fetch_futures_depth(
             "asks": _parse_levels(d.get("asks")),
         }
     if v == "bybit":
-        d = http_get_json(
-            f"https://api.bybit.com/v5/market/orderbook"
-            f"?category=linear&symbol={sym}&limit={min(limit, 200)}",
-            timeout=15,
-        )
+        from venues.bybit import _base_url, _public_get, _testnet_only
+        url = f"{_base_url()}/v5/market/orderbook?category=linear&symbol={sym}&limit={min(limit, 200)}"
+        d = _public_get(url, timeout=15) if _testnet_only() else http_get_json(url, timeout=15)
         result = d.get("result", {}) if isinstance(d, dict) else {}
         return {
             "bids": _parse_levels(result.get("b")),

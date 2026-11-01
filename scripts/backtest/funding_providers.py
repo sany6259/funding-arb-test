@@ -253,11 +253,18 @@ class BitgetFundingProvider(FundingProvider):
 
 class BybitFundingProvider(FundingProvider):
     venue_id = "bybit"
-    BASE = "https://api.bybit.com"
+    @property
+    def BASE(self) -> str:
+        from venues.bybit import _base_url
+        return _base_url()
+
+    def _get(self, url: str) -> Any:
+        from venues.bybit import _public_get, _testnet_only
+        return _public_get(url) if _testnet_only() else _http_get_with_retry(url)
 
     def fetch_all(self, quote: str = "USDT") -> list[dict[str, Any]]:
         url = f"{self.BASE}/v5/market/tickers?category=linear"
-        payload = _http_get_with_retry(url)
+        payload = self._get(url)
         rows = (
             payload.get("result", {}).get("list", [])
             if isinstance(payload, dict)
@@ -287,7 +294,7 @@ class BybitFundingProvider(FundingProvider):
     def fetch_current(self, symbol: str) -> dict[str, Any]:
         sym = symbol.upper()
         url = f"{self.BASE}/v5/market/tickers?category=linear&symbol={sym}"
-        payload = _http_get_with_retry(url)
+        payload = self._get(url)
         row = (payload.get("result", {}).get("list") or [{}])[0]
         rate = float(row.get("fundingRate", 0) or 0) * 100
         next_ts = int(row.get("nextFundingTime", 0) or 0)
@@ -317,7 +324,7 @@ class BybitFundingProvider(FundingProvider):
             )
             if cursor:
                 url += f"&cursor={cursor}"
-            payload = _http_get_with_retry(url)
+            payload = self._get(url)
             result = payload.get("result", {}) if isinstance(payload, dict) else {}
             rows = result.get("list", [])
             if not rows:
