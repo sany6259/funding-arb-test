@@ -37,6 +37,8 @@ jobs:
         with:
           node-version: "22"
       - run: bash scripts/tests/smoke_install.sh
+      - run: npm run test:i18n
+        working-directory: web
       - run: test -z "$(git status --porcelain)"
 
   docs-sync:

@@ -8,6 +8,20 @@ import { useI18n } from 'vue-i18n'
 const { t } = useI18n()
 const credentials = getCredentialsStatus()
 
+const backendDescriptions: Record<string, string> = {
+  "macOS Keychain / System Key Management": "mac",
+  "keyring package not installed": "keyringMissing",
+  "systemd-creds (Linux TPM2)": "systemd",
+  "Linux only": "linuxOnly",
+  "age encrypted file": "age",
+  "age tool not installed": "ageMissing",
+  "Plaintext JSON (fallback)": "plaintext"
+}
+function localizedDescription(description: string): string {
+  const key = backendDescriptions[description]
+  return key ? t(`credentialBackends.${key}`) : description
+}
+
 onMounted(async () => {
   await credentials.refresh()
 })
@@ -24,7 +38,7 @@ onMounted(async () => {
               <n-icon v-else color="#d03050" size="18"><CloseCircleOutline /></n-icon>
               <n-text>{{ name }}</n-text>
             </div>
-            <n-text depth="3" style="font-size: 11px">{{ info.description }}</n-text>
+            <n-text depth="3" style="font-size: 11px">{{ localizedDescription(info.description) }}</n-text>
           </div>
         </div>
         <n-divider style="margin: 12px 0" />

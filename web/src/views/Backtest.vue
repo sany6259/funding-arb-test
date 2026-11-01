@@ -108,7 +108,7 @@ const equityChartOption = computed(() => {
         const idx = params[0]?.dataIndex ?? 0
         const pt = curve[idx]
         if (!pt) return ''
-        return `${pt.ts}<br/>Equity: $${pt.equity.toLocaleString()}<br/>Open pairs: ${pt.open_pairs ?? 0}`
+        return `${pt.ts}<br/>${t('backtest.equity')}: $${pt.equity.toLocaleString()}<br/>${t('backtest.openPairs')}: ${pt.open_pairs ?? 0}`
       },
     },
     grid: { left: 48, right: 16, top: 24, bottom: 32 },
@@ -176,10 +176,10 @@ async function syncFromStrategy() {
       tradeUsd.value = s.trade_usd ?? tradeUsd.value
       maxPositions.value = s.max_positions ?? maxPositions.value
       allowMismatch.value = (s.min_edge_mismatch ?? 0) > 0
-      message.success('Synced from strategy settings')
+      message.success(t('backtest.syncSuccess'))
     }
   } catch {
-    message.error('Failed to sync strategy settings')
+    message.error(t('backtest.syncFailed'))
   }
 }
 
@@ -243,18 +243,18 @@ onMounted(() => {
           <n-form-item :label="t('backtest.exitEdge')">
             <n-input-number v-model:value="exitEdge" :min="0" :max="100" :step="0.005" style="width: 100%" />
           </n-form-item>
-          <n-form-item label="Min Edge">
+          <n-form-item :label="t('backtest.minEdge')">
             <n-input-number v-model:value="minEdge" :min="0" :max="10" :step="0.005" :precision="3" style="width: 100%" />
           </n-form-item>
-          <n-form-item label="Max Hold (h)">
+          <n-form-item :label="t('backtest.maxHold')">
             <n-input-number v-model:value="maxHoldingHours" :min="1" :max="2160" :step="24" style="width: 100%" />
           </n-form-item>
-          <n-form-item label="Cross-Interval">
+          <n-form-item :label="t('backtest.crossInterval')">
             <n-switch v-model:value="allowMismatch" />
           </n-form-item>
           <div class="param-actions">
             <n-button secondary size="small" @click="syncFromStrategy">
-              Sync from Strategy
+              {{ t('backtest.syncStrategy') }}
             </n-button>
             <n-button type="primary" size="small" :loading="running" @click="runBacktest">
               <template #icon><n-icon><PlayOutline /></n-icon></template>

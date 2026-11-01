@@ -45,7 +45,7 @@ export function getDocSections(
   locale: string,
 ): DocSection[] {
   return (
-    article.sectionsByLocale[locale] ?? article.sectionsByLocale["zh-CN"] ?? []
+    article.sectionsByLocale[locale] ?? article.sectionsByLocale["en"] ?? article.sectionsByLocale["zh-CN"] ?? []
   );
 }
 

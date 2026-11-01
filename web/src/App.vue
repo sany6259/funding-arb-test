@@ -15,7 +15,7 @@ import {
   NTag,
   NMessageProvider,
   NSelect,
-  darkTheme,
+  darkTheme, ruRU, enUS, zhCN, zhTW, dateRuRU, dateEnUS, dateZhCN, dateZhTW,
   type MenuOption,
 } from 'naive-ui'
 import {
@@ -36,6 +36,8 @@ import DemoBanner from '@/components/DemoBanner.vue'
 import i18n, { setLocale, SUPPORTED_LOCALES, type SupportedLocale } from '@/i18n'
 
 const { t } = useI18n()
+const naiveLocale = computed(() => ({ ru: ruRU, en: enUS, 'zh-CN': zhCN, 'zh-TW': zhTW }[currentLocale.value]))
+const naiveDateLocale = computed(() => ({ ru: dateRuRU, en: dateEnUS, 'zh-CN': dateZhCN, 'zh-TW': dateZhTW }[currentLocale.value]))
 const router = useRouter()
 const route = useRoute()
 const collapsed = ref(true)
@@ -152,7 +154,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <n-config-provider :theme="darkTheme">
+  <n-config-provider :theme="darkTheme" :locale="naiveLocale" :date-locale="naiveDateLocale">
     <n-layout has-sider class="app-layout">
       <n-layout-sider
         bordered
