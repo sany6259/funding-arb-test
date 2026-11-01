@@ -339,3 +339,23 @@ def test_dashboard_fails_closed_in_testnet_mode(monkeypatch):
     monkeypatch.setenv("BYBIT_REQUIRE_TESTNET", "1")
     with pytest.raises(RuntimeError, match="dashboard isolation is not implemented"):
         runpy.run_module("server.main", run_name="testnet_dashboard_check")
+
+
+def test_authenticated_request_keeps_initial_testnet_mode(monkeypatch):
+    import json
+    monkeypatch.setenv("BYBIT_TESTNET_API_KEY", "test-key")
+    monkeypatch.setenv("BYBIT_TESTNET_SECRET_KEY", "test-secret")
+    calls = []
+    modes = iter([True, False, False])
+    monkeypatch.setattr(bybit, "_testnet_only", lambda: next(modes))
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+        def read(self): return json.dumps({"retCode": 0, "result": {}}).encode()
+    class Opener:
+        def open(self, request, timeout):
+            calls.append((request.full_url, request.get_header("X-bapi-api-key")))
+            return Response()
+    monkeypatch.setattr(bybit.urllib.request, "build_opener", lambda handler: Opener())
+    bybit._api_call("GET", "/v5/account/info")
+    assert calls == [("https://api-testnet.bybit.com/v5/account/info", "test-key")]

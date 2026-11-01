@@ -124,7 +124,11 @@ def _api_call(
         raise ValueError("Invalid Bybit API path")
     if testnet and method != "GET" and os.environ.get("BYBIT_TESTNET_ALLOW_ORDERS") != "1":
         raise RuntimeError("Bybit testnet writes require explicit BYBIT_TESTNET_ALLOW_ORDERS=1")
-    key, secret = _get_key(), _get_secret()
+    if testnet:
+        key = os.environ.get("BYBIT_TESTNET_API_KEY") or ""
+        secret = os.environ.get("BYBIT_TESTNET_SECRET_KEY") or ""
+    else:
+        key, secret = _get_key(), _get_secret()
     if not (key and secret):
         if testnet:
             raise RuntimeError("Bybit testnet credentials missing: set BYBIT_TESTNET_API_KEY and BYBIT_TESTNET_SECRET_KEY")
@@ -145,7 +149,7 @@ def _api_call(
     full_path = path + ("?" + query if query else "")
 
     prehash = ts + key + recv_window + (query if method == "GET" else body_str)
-    sig = _sign(prehash)
+    sig = hmac.new(secret.encode(), prehash.encode(), hashlib.sha256).hexdigest()
 
     headers = {
         "X-BAPI-API-KEY": key,
@@ -158,7 +162,7 @@ def _api_call(
     retries = 3 if method == "GET" else 1
     last_err: Optional[Exception] = None
     for attempt in range(retries):
-        url = _base_url() + full_path
+        url = (TESTNET_BASE if testnet else BASE) + full_path
         req = urllib.request.Request(url, headers=headers, method=method)
         if body_str:
             req.data = body_str.encode()
