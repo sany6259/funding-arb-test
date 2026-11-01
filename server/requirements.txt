@@ -1,3 +1,5 @@
+# Minimal dashboard and scanner runtime dependencies.
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 websockets>=12.0
+requests>=2.28

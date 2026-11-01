@@ -10,13 +10,18 @@ Thanks for your interest in contributing. This is a trading system, so a few ext
 
 ## Development setup
 
+On Ubuntu 24.04 install Python 3.12 with `python3-venv` and Node.js 20.19+ or 22.12+ (Node 21 is unsupported). From the repository root:
+
 ```bash
-git clone https://github.com/counterfactual5/funding-arb.git
-cd funding-arb
-bash setup.sh
-pip install -r requirements.txt
-pip install -r server/requirements.txt
+bash setup.sh                       # creates .venv and preserves existing .env
+bash start.sh --build-web           # npm ci using the committed lockfile
+bash start.sh --api-only            # API on 127.0.0.1:8787
+# Or: bash start.sh                 # browser mode
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest scripts/tests/ -q
 ```
+
+`setup.sh` installs only the dashboard runtime. To install optional venue SDKs and keyring for live integrations, use `.venv/bin/python -m pip install -r requirements-optional.txt`. Installing `requirements.txt` retains the complete historical dependency set. Desktop mode additionally requires the Tauri system prerequisites and Rust. The install smoke test in CI runs on a clean checkout; it must not be run against an existing server on port 8787.
 
 ## Running tests
 

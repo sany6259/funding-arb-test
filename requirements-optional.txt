@@ -1,0 +1,6 @@
+# Optional credential storage and live-trading SDKs.
+keyring>=23.0
+lighter-sdk>=1.0
+edgex-python-sdk>=2.0.0
+dydx-v4-client>=1.1.5
+hyperliquid-python-sdk>=0.22.0
