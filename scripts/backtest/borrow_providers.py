@@ -160,7 +160,8 @@ class OkxBorrowProvider(BorrowProvider):
     def _http_get(self, path: str) -> dict[str, Any]:
         url = self.BASE + path
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        from core.execution_mode import simulation_request
+        with simulation_request(urllib.request.urlopen, req, timeout=20) as resp:
             return json.loads(resp.read().decode())
 
     def _margin_bases(self) -> set[str]:

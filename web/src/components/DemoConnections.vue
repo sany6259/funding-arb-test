@@ -27,7 +27,7 @@ async function refresh() {
     storeError.value = ''
   } catch {
     for (const venue of venues) configured[venue.id] = null
-    storeError.value = 'Защищённое системное хранилище недоступно.'
+    storeError.value = 'Защищённое хранилище недоступно.'
   }
 }
 onMounted(refresh)
@@ -77,7 +77,7 @@ async function action(venue: Venue, operation: 'save' | 'delete' | 'check') {
     <n-alert v-if="!localAccess" type="error">Доступ к ключам разрешён только через локальный адрес или SSH-туннель.</n-alert>
     <n-alert v-if="storeError" type="error">{{ storeError }}</n-alert>
     <n-alert type="warning" title="Демо: только проверка подключения">
-      Используйте отдельные демоключи без права вывода. Они сохраняются в системном защищённом хранилище. Ордера отключены; проверка баланса не подтверждает готовность к торговле.
+      Используйте отдельные демоключи без права вывода. Они сохраняются в защищённом хранилище. Ордера отключены; проверка баланса не подтверждает готовность к торговле.
     </n-alert>
     <n-card v-for="venue in venues" :key="venue.id" :title="venue.name" size="small">
       <n-space vertical>

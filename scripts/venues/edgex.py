@@ -141,6 +141,8 @@ class EdgexVenue:
     # ── account / positions (V2 SDK, async wrapped) ────────────────────
 
     def _make_client(self) -> Any:
+        from core.execution_mode import require_simulation_api
+        require_simulation_api()
         from edgex_sdk import Client
 
         account_id = os.environ.get("EDGEX_ACCOUNT_ID", "").strip()
@@ -160,6 +162,8 @@ class EdgexVenue:
     async def _get_asset(self) -> Any:
         client = self._make_client()
         try:
+            from core.execution_mode import require_simulation_api
+            require_simulation_api()
             return await client.get_account_asset()
         finally:
             await self._close(client)
@@ -167,6 +171,8 @@ class EdgexVenue:
     async def _get_positions(self) -> Any:
         client = self._make_client()
         try:
+            from core.execution_mode import require_simulation_api
+            require_simulation_api()
             return await client.get_account_positions()
         finally:
             await self._close(client)

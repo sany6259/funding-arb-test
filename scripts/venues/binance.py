@@ -87,6 +87,8 @@ def _api_call(
     if method.upper() != "GET":
         from core.execution_mode import forbid_orders
         forbid_orders()
+    from core.execution_mode import require_simulation_api
+    require_simulation_api()
     base_params = dict(params or {})
     if signed:
         # Credential validation: fail immediately on missing credentials; never send private requests with empty credentials
@@ -115,7 +117,8 @@ def _api_call(
             headers = {}
         req = urllib.request.Request(url, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            from core.execution_mode import simulation_request
+            with simulation_request(urllib.request.urlopen, req, timeout=15) as resp:
                 return json.loads(resp.read().decode())
         except Exception as e:
             last_err = e

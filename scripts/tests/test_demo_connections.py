@@ -307,3 +307,166 @@ def test_http_demo_lifecycle_uses_no_secret_in_response(monkeypatch):
         assert (await request('/api/demo/credentials/delete', data()))[0] == 200
         assert (await request('/api/demo/check', data()))[0] == 409
     run(scenario())
+
+
+def test_age_store_fails_closed_without_tools_or_identity(monkeypatch, tmp_path):
+    monkeypatch.setenv('FARB_DEMO_CREDENTIAL_STORE', 'age')
+    monkeypatch.setenv('FARB_DEMO_AGE_IDENTITY', str(tmp_path / 'missing-identity'))
+    with pytest.raises((OSError, RuntimeError)):
+        demo_credentials.save('bybit', 'demo', 'dummy-key', 'dummy-secret', '')
+    assert not list(tmp_path.rglob('*.age'))
+    monkeypatch.setenv('FARB_DEMO_CREDENTIAL_STORE', 'unknown')
+    with pytest.raises(RuntimeError):
+        demo_credentials.load('bybit', 'demo')
+
+
+def test_age_store_real_cli_survives_process_and_never_writes_plaintext(monkeypatch, tmp_path):
+    import shutil
+    age, keygen = shutil.which('age'), shutil.which('age-keygen')
+    if not age or not keygen:
+        pytest.skip('age executables unavailable')
+    if os.name == 'nt':
+        pytest.skip('POSIX identity permission test')
+    home = tmp_path / 'home'
+    home.mkdir(mode=0o700)
+    identity = home / 'demo.key'
+    subprocess.run([keygen, '-o', str(identity)], capture_output=True, check=True)
+    identity.chmod(0o600)
+    monkeypatch.setenv('HOME', str(home))
+    monkeypatch.setenv('FARB_DEMO_CREDENTIAL_STORE', 'age')
+    monkeypatch.setenv('FARB_DEMO_AGE_IDENTITY', str(identity))
+    demo_credentials.save('bybit', 'demo', 'dummy-key-a', 'dummy-secret-a', '')
+    demo_credentials.save('okx', 'demo', 'dummy-okx', 'dummy-secret', 'dummy-pass')
+    demo_credentials.save('bybit', 'demo', 'dummy-key-b', 'dummy-secret-b', '')
+    encrypted = home / '.funding-arb' / 'demo-credentials' / 'demo-bybit.age'
+    raw = encrypted.read_bytes()
+    assert raw.startswith(b'age-encryption.org/v1\n')
+    assert all(value not in raw for value in (b'dummy-key-a', b'dummy-key-b', b'dummy-secret-b'))
+    # Copying one venue's ciphertext into another slot must not cross environments.
+    okx_file = encrypted.with_name('demo-okx.age')
+    okx_original = okx_file.read_bytes()
+    okx_file.write_bytes(raw)
+    with pytest.raises(RuntimeError, match='environment mismatch'):
+        demo_credentials.load('okx', 'demo')
+    okx_file.write_bytes(okx_original)
+    env = os.environ.copy()
+    env['PYTHONPATH'] = str(ROOT / 'scripts')
+    code = ("from core.demo_credentials import load; "
+            "assert load('bybit','demo')['key']=='dummy-key-b'; "
+            "assert load('okx','demo')['key']=='dummy-okx'; print('PASS')")
+    result = subprocess.run([sys.executable, '-c', code], env=env, capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == 'PASS'
+    identity.chmod(0o644)
+    with pytest.raises(RuntimeError): demo_credentials.load('bybit', 'demo')
+    identity.chmod(0o600)
+    demo_credentials.delete('bybit', 'demo')
+    assert demo_credentials.load('bybit', 'demo') is None
+    assert demo_credentials.load('okx', 'demo')['key'] == 'dummy-okx'
+
+
+def test_legacy_production_access_denied_before_network(monkeypatch):
+    from venues import http_util, bybit, okx, bitget
+    from server.routes import scanner
+    execution_mode.set_mode('demo')
+    monkeypatch.setattr(http_util._session, 'get', lambda *args, **kwargs: pytest.fail('network invoked'))
+    with pytest.raises(RuntimeError, match='Legacy API access disabled'):
+        http_util.http_get_json('https://api.bybit.com/v5/market/tickers')
+    for adapter, path in ((bybit, '/v5/account/info'), (okx, '/api/v5/account/balance'), (bitget, '/api/v2/spot/account/assets')):
+        with pytest.raises(RuntimeError, match='Legacy API access disabled'):
+            adapter._api_call('GET', path)
+    assert run(scanner.scanner_trigger(strategy='pure'))['success'] is False
+    (execution_mode._directory() / 'execution-mode.json').write_text('{broken')
+    with pytest.raises(RuntimeError, match='Legacy API access disabled'):
+        http_util.http_get_json('https://api.bybit.com/v5/market/tickers')
+
+
+def test_mode_transition_waits_for_inflight_legacy_request(monkeypatch, tmp_path):
+    import time
+    home = tmp_path / 'home'
+    home.mkdir()
+    monkeypatch.setattr(execution_mode, '_directory', lambda: home / '.funding-arb')
+    env = os.environ.copy()
+    env.update(HOME=str(home), USERPROFILE=str(home), PYTHONPATH=str(ROOT / 'scripts'))
+    ready, release, changed = (tmp_path / name for name in ('ready', 'release', 'changed'))
+    worker = '''import sys,time
+from pathlib import Path
+from core.execution_mode import simulation_request
+ready,release=map(Path,sys.argv[1:])
+def send():
+ ready.touch()
+ deadline=time.monotonic()+10
+ while not release.exists():
+  if time.monotonic()>deadline: raise RuntimeError('timeout')
+  time.sleep(.02)
+simulation_request(send)
+'''
+    changer = '''import sys
+from pathlib import Path
+from core.execution_mode import set_mode
+set_mode('demo')
+Path(sys.argv[1]).touch()
+'''
+    first = subprocess.Popen([sys.executable, '-c', worker, str(ready), str(release)], env=env)
+    second = None
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert ready.exists()
+        second = subprocess.Popen([sys.executable, '-c', changer, str(changed)], env=env)
+        time.sleep(.2)
+        assert not changed.exists(), 'mode changed before an in-flight request finished'
+        release.touch()
+        assert first.wait(timeout=5) == 0
+        assert second.wait(timeout=5) == 0 and changed.exists()
+        with pytest.raises(RuntimeError):
+            execution_mode.simulation_request(lambda: pytest.fail('network invoked'))
+    finally:
+        release.touch()
+        if first.poll() is None: first.kill(); first.wait()
+        if second is not None and second.poll() is None: second.kill(); second.wait()
+
+
+def test_diagnostic_uses_fake_store_and_separate_processes():
+    import shutil
+    import tempfile
+    if os.name == 'nt' or not shutil.which('age') or not shutil.which('age-keygen'):
+        pytest.skip('POSIX age diagnostic requires age binaries')
+    env = os.environ.copy()
+    env['PYTHONPATH'] = str(ROOT / 'scripts')
+    script = ROOT / 'scripts' / 'cli' / 'demo_age_diagnostic.py'
+    with tempfile.TemporaryDirectory(prefix='funding-arb-pr16-probe-', dir='/tmp') as probe:
+        for phase in ('create', 'verify', 'verify', 'delete'):
+            completed = subprocess.run([sys.executable, str(script), phase, probe], env=env,
+                                       capture_output=True, text=True, check=True)
+            assert 'PASS:' in completed.stdout and 'dummy-secret' not in completed.stdout
+        assert not (Path(probe) / 'home' / '.funding-arb' / 'demo-credentials' / 'demo-bybit.age').exists()
+
+
+def test_age_backend_with_mocked_executable_on_all_platforms(monkeypatch, tmp_path):
+    # Mock the age process to exercise persistence and fail-closed routing in CI.
+    # Cryptographic behavior is checked separately with the real age executable.
+    import base64
+    identity = tmp_path / 'dummy-age.key'
+    identity.write_text('dummy identity')
+    identity.chmod(0o600)
+    monkeypatch.setenv('FARB_DEMO_CREDENTIAL_STORE', 'age')
+    monkeypatch.setenv('FARB_DEMO_AGE_IDENTITY', str(identity))
+    monkeypatch.setattr(demo_credentials, '_age_dir', lambda: tmp_path / 'store')
+    monkeypatch.setattr(demo_credentials.shutil, 'which', lambda name: name)
+    def fake_run(command, *, input, capture_output, check, timeout):
+        if command[0] == 'age-keygen':
+            return SimpleNamespace(stdout=b'age1dummyrecipient\n')
+        if '-d' in command:
+            assert input.startswith(b'age-encryption.org/v1\n')
+            return SimpleNamespace(stdout=base64.b64decode(input.split(b'\n', 1)[1]))
+        return SimpleNamespace(stdout=b'age-encryption.org/v1\n' + base64.b64encode(input))
+    monkeypatch.setattr(demo_credentials.subprocess, 'run', fake_run)
+    demo_credentials.save('bybit', 'demo', 'dummy-first', 'dummy-secret', '')
+    assert demo_credentials.load('bybit', 'demo')['key'] == 'dummy-first'
+    demo_credentials.save('bybit', 'demo', 'dummy-second', 'dummy-secret', '')
+    assert demo_credentials.load('bybit', 'demo')['key'] == 'dummy-second'
+    blob = (tmp_path / 'store' / 'demo-bybit.age').read_bytes()
+    assert b'dummy-first' not in blob and b'dummy-second' not in blob
+    demo_credentials.delete('bybit', 'demo')
+    assert demo_credentials.load('bybit', 'demo') is None

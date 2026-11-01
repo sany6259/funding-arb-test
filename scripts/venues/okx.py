@@ -80,6 +80,8 @@ def _api_call(
     if method.upper() != "GET":
         from core.execution_mode import forbid_orders
         forbid_orders()
+    from core.execution_mode import require_simulation_api
+    require_simulation_api()
     key, secret, passp = _get_key(), _get_secret(), _get_pass()
     if not (key and secret and passp):
         raise RuntimeError(
@@ -109,7 +111,8 @@ def _api_call(
         if body_str:
             req.data = body_str.encode()
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            from core.execution_mode import simulation_request
+            with simulation_request(urllib.request.urlopen, req, timeout=15) as resp:
                 data = json.loads(resp.read().decode())
             if data.get("code") != "0":
                 raise RuntimeError(

@@ -391,6 +391,8 @@ class DydxVenue:
 
     def _ensure_wallet(self) -> tuple[Any, Any]:
         """Build the live wallet+node client from env (raises on missing creds)."""
+        from core.execution_mode import require_simulation_api
+        require_simulation_api()
         if self._wallet is not None and self._node is not None:
             return self._wallet, self._node
         _ensure_sdk()

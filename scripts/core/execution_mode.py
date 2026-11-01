@@ -14,6 +14,10 @@ _MODES = ('simulation', 'demo')
 _thread_lock = threading.RLock()
 
 
+class LegacyAccessBlocked(RuntimeError):
+    """A legacy network call was rejected before sending."""
+
+
 def _directory() -> Path:
     return Path.home() / '.funding-arb'
 
@@ -79,3 +83,29 @@ def forbid_orders() -> None:
     except Exception:
         raise RuntimeError('Execution mode unavailable; orders disabled') from None
     raise RuntimeError('Orders disabled during demo account setup')
+
+
+def require_simulation_api() -> None:
+    """Legacy production/public routes are unavailable outside simulation."""
+    try:
+        if current_mode() == 'simulation':
+            return
+    except Exception:
+        pass
+    raise LegacyAccessBlocked('Legacy API access disabled in demo or unknown mode') from None
+
+
+def simulation_request(call, *args, **kwargs):
+    """Hold the cross-process mode lock until a legacy request is sent.
+
+    A switch to demo waits for any already-started request, so no new
+    legacy request can cross the transition.
+    """
+    with _locked() as directory:
+        try:
+            mode = _read(directory)
+        except Exception:
+            raise LegacyAccessBlocked('Legacy API access disabled in demo or unknown mode') from None
+        if mode != 'simulation':
+            raise LegacyAccessBlocked('Legacy API access disabled in demo or unknown mode')
+        return call(*args, **kwargs)

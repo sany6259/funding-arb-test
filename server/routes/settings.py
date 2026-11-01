@@ -823,6 +823,11 @@ async def get_wallet_balance(venue: str, address: str, network: str | None = Non
     Keplr/MetaMask, not from stored env vars. ``network`` (mainnet/testnet)
     comes from the extension's selected chain; it overrides the env default.
     """
+    from core.execution_mode import require_simulation_api
+    try:
+        require_simulation_api()
+    except RuntimeError:
+        return {"success": False, "error": "Production API недоступен в деморежиме."}
     if not address or len(address) < 10:
         return {"success": False, "error": "Invalid address"}
 
@@ -842,7 +847,8 @@ async def get_wallet_balance(venue: str, address: str, network: str | None = Non
             if is_testnet:
                 base = "https://indexer.v4testnet.dydx.exchange"
             subaccount_number = int(os.environ.get("DYDX_SUBACCOUNT_NUMBER", "0") or 0)
-            resp = _requests.get(
+            from core.execution_mode import simulation_request
+            resp = simulation_request(_requests.get,
                 f"{base}/v4/subaccounts",
                 params={"address": address, "subaccountNumber": subaccount_number},
                 timeout=15,
@@ -870,7 +876,8 @@ async def get_wallet_balance(venue: str, address: str, network: str | None = Non
             )
             if is_testnet:
                 hl_base = "https://api.hyperliquid-testnet.xyz"
-            resp = _requests.post(
+            from core.execution_mode import simulation_request
+            resp = simulation_request(_requests.post,
                 f"{hl_base}/info",
                 json={"type": "clearinghouseState", "user": address},
                 timeout=15,
@@ -886,7 +893,8 @@ async def get_wallet_balance(venue: str, address: str, network: str | None = Non
 
             lighter_base = "https://mainnet.zklighter.elliot.ai"
             # Lighter uses L1 address to look up account
-            data = _requests.get(
+            from core.execution_mode import simulation_request
+            data = simulation_request(_requests.get,
                 f"{lighter_base}/api/v1/accountsByL1Address?l1_address={address}",
                 timeout=15,
             )

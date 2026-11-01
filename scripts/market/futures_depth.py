@@ -141,7 +141,8 @@ def _fetch_hyperliquid_depth(base: str) -> Book:
         data=body,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    from core.execution_mode import simulation_request
+    with simulation_request(urllib.request.urlopen, req, timeout=15) as resp:
         d = _json.loads(resp.read().decode())
     levels = d.get("levels") or [[], []]
 
@@ -235,7 +236,8 @@ def _fetch_dydx_depth(base: str, limit: int = 50) -> Book:
     ticker = f"{base.upper()}-USD"
     url = f"https://indexer.dydx.trade/v4/orderbooks/perpetualMarket/{ticker}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    from core.execution_mode import simulation_request
+    with simulation_request(urllib.request.urlopen, req, timeout=15) as resp:
         d = _json.loads(resp.read().decode())
 
     def _conv(rows: Any) -> list[tuple[float, float]]:

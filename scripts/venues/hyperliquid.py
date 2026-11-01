@@ -70,11 +70,12 @@ def _get_wallet_address() -> str:
 
 def _make_info_client() -> Any:
     """Create Info client with spot_meta workaround (avoids IndexError)."""
+    from core.execution_mode import LegacyAccessBlocked, simulation_request
     sdk = _get_sdk()
     url = _get_base_url()
     # Workaround: fetch spot_meta manually to fix token array misalignment
     try:
-        spot_meta = requests.post(
+        spot_meta = simulation_request(requests.post,
             f"{url}/info", json={"type": "spotMeta"}, timeout=15
         ).json()
         tokens = spot_meta.get("tokens", [])
@@ -86,13 +87,17 @@ def _make_info_client() -> Any:
                 if idx < len(fixed):
                     fixed[idx] = t
             spot_meta = dict(spot_meta, tokens=fixed)
-        return sdk["Info"](url, skip_ws=True, spot_meta=spot_meta)
+        return simulation_request(sdk["Info"], url, skip_ws=True, spot_meta=spot_meta)
+    except LegacyAccessBlocked:
+        raise
     except Exception:
-        return sdk["Info"](url, skip_ws=True)
+        return simulation_request(sdk["Info"], url, skip_ws=True)
 
 
 def _make_exchange_client() -> Any:
     """Create Exchange client with local key or trade-signer."""
+    from core.execution_mode import require_simulation_api, simulation_request
+    require_simulation_api()
     sdk = _get_sdk()
     url = _get_base_url()
     wallet = _get_wallet_address()
@@ -104,7 +109,7 @@ def _make_exchange_client() -> Any:
     if key:
         if not key.startswith("0x"):
             key = "0x" + key
-        return sdk["Exchange"](url, wallet=wallet, account=wallet, secret=key)
+        return simulation_request(sdk["Exchange"], url, wallet=wallet, account=wallet, secret=key)
     # Try trade-signer
     signer_url = os.environ.get("TRADE_SIGNER_URL", "").strip()
     if signer_url:
@@ -153,7 +158,8 @@ def _make_exchange_with_tradesigner(base_url: str, wallet: str, signer_url: str)
         headers = {"Content-Type": "application/json"}
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
-        resp = _requests.post(
+        from core.execution_mode import simulation_request
+        resp = simulation_request(_requests.post,
             f"{signer_url}/sign-typed-data",
             json=payload,
             headers=headers,
@@ -180,7 +186,8 @@ def _make_exchange_with_tradesigner(base_url: str, wallet: str, signer_url: str)
         def key(self) -> str:
             return self._address
 
-    return sdk["Exchange"](_DummyWallet(wallet), base_url)
+    from core.execution_mode import simulation_request
+    return simulation_request(sdk["Exchange"], _DummyWallet(wallet), base_url)
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +258,8 @@ def _pair_from_coin(coin: str) -> str:
 
 def _info_post(body: dict[str, Any]) -> Any:
     """Direct HTTP POST to Hyperliquid Info endpoint (bypasses SDK bugs)."""
-    r = requests.post(f"{_base_url()}/info", json=body, timeout=20)
+    from core.execution_mode import simulation_request
+    r = simulation_request(requests.post, f"{_base_url()}/info", json=body, timeout=20)
     r.raise_for_status()
     return r.json()
 
@@ -344,7 +352,8 @@ class HyperliquidVenue:
             wallet = _get_wallet_address()
             if not wallet:
                 return {"spot": 0.0, "futures": 0.0}
-            state = info.user_state(wallet)
+            from core.execution_mode import simulation_request
+            state = simulation_request(info.user_state, wallet)
             margin = state.get("marginSummary", {})
             val = float(margin.get("accountValue", 0) or 0)
             return {"spot": 0.0, "futures": val}
@@ -357,7 +366,8 @@ class HyperliquidVenue:
             wallet = _get_wallet_address()
             if not wallet:
                 return []
-            state = info.user_state(wallet)
+            from core.execution_mode import simulation_request
+            state = simulation_request(info.user_state, wallet)
             positions = []
             for p in state.get("assetPositions", []):
                 pos = p.get("position", {})
@@ -392,6 +402,8 @@ class HyperliquidVenue:
         if coin in self._leverage_set:
             return
         try:
+            from core.execution_mode import forbid_orders
+            forbid_orders()
             exchange = _make_exchange_client()
             exchange.leverage_update(coin=coin, leverage=1, is_cross=True)
             self._leverage_set.add(coin)
@@ -445,7 +457,8 @@ class HyperliquidVenue:
                 exchange = _make_exchange_client()
                 info = _make_info_client()
                 # Get mid price for slippage calc
-                all_mids = info.all_mids()
+                from core.execution_mode import simulation_request
+                all_mids = simulation_request(info.all_mids)
                 mid = Decimal(str(all_mids[coin]))
                 slippage_dec = Decimal("0.01")
                 if is_buy:
