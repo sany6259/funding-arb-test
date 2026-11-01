@@ -8,11 +8,13 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Query
 
 router = APIRouter(tags=["scanner"])
+
+ScannerStrategy = Literal["pure", "carry", "unified"]
 
 # Ensure the server's main module is importable for the broadcast helper.
 _SERVER_DIR = Path(__file__).resolve().parent.parent
@@ -397,7 +399,7 @@ def _scanner_available(strategy: str) -> bool:
 
 @router.get("/scanner/status")
 async def scanner_status(
-    strategy: str = Query("pure", enum=["pure", "carry", "unified"]),
+    strategy: ScannerStrategy = Query("pure"),
 ):
     """Return current scanner status for the requested strategy."""
     live = False
@@ -436,7 +438,7 @@ async def scanner_status(
 
 @router.get("/scanner/opportunities")
 async def scanner_opportunities(
-    strategy: str = Query("pure", enum=["pure", "carry", "unified"]),
+    strategy: ScannerStrategy = Query("pure"),
     venues: str | None = Query(
         None, description="Comma-separated venue ids; cache must match to return data"
     ),
@@ -505,7 +507,7 @@ async def scanner_opportunities(
 
 @router.post("/scanner/trigger")
 async def scanner_trigger(
-    strategy: str = Query("pure", enum=["pure", "carry", "unified"]),
+    strategy: ScannerStrategy = Query("pure"),
     venues: str | None = Query(
         None, description="Comma-separated venue ids (overrides saved scan_venues)"
     ),

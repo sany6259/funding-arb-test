@@ -34,3 +34,15 @@ jobs:
         with:
           node-version: "20"
       - run: bash scripts/tools/check_docs_sync.sh
+
+  scanner-validation-pydantic1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The minimum supported FastAPI also allows Pydantic 1; keep its
+      # query-validation behavior covered alongside the default CI install.
+      - run: pip install 'fastapi==0.110.0' 'pydantic<2' requests pytest
+      - run: python -m pytest scripts/tests/test_scanner_query_validation.py -q
