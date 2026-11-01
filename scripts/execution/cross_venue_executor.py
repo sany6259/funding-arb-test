@@ -15,6 +15,7 @@ Position records are stored in scripts/data/cross-venue/positions.json for closi
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 import uuid
@@ -95,6 +96,17 @@ def _mark_closed(
             _save_positions(positions, path)
             return True
     return False
+
+
+def _mark_reconcile(position_id: str, executed: list[dict[str, Any]], path: Path) -> None:
+    positions = load_positions(path)
+    for position in positions:
+        if position.get("id") == position_id:
+            position["status"] = "reconcile_required"
+            position["reconciliation_executed"] = executed
+            _save_positions(positions, path)
+            return
+    raise RuntimeError("Position missing; manual reconciliation required")
 
 
 # ── Market / rules snapshot ────────────────────────────────────────────────────
@@ -193,6 +205,14 @@ def open_cross_venue_position(
     """Cross-venue open. forward: spot buy + perp short; reverse: margin borrow-sell + perp long."""
     logs: list[str] = []
     executed: list[dict[str, Any]] = []
+    if "BYBIT_REQUIRE_TESTNET" in os.environ and (
+        os.environ.get("BYBIT_REQUIRE_TESTNET") != "1" or
+        futures_venue_id != "bybit" or spot_venue_id != "bybit" or
+        direction != "forward" or base.upper() != "BTC" or quote.upper() != "USDT"
+    ):
+        return CrossVenueResult(False, "aborted", logs=["Testnet mode permits only Bybit BTC/USDT forward carry"])
+    if any(p.get("status") == "reconcile_required" for p in load_positions(positions_path)):
+        return CrossVenueResult(False, "reconcile_required", logs=["Resolve existing uncertain position before opening another"])
     fv = futures_venue or get_venue({"venue": {"type": futures_venue_id}})
     sv = spot_venue or get_venue({"venue": {"type": spot_venue_id}})
 
@@ -266,6 +286,15 @@ def open_cross_venue_position(
     fut_market = {base: fut_mkt}
     position_id = f"xv-{int(time.time())}-{uuid.uuid4().hex[:6]}"
 
+    def require_reconciliation(reason: str, qty: float) -> CrossVenueResult:
+        logs.append(reason + "; stop and reconcile manually")
+        _record_position({"id": position_id, "status": "reconcile_required",
+                          "strategy": "carry", "dry_run": False, "base": base,
+                          "direction": direction, "futures_venue": futures_venue_id,
+                          "spot_venue": spot_venue_id, "qty": qty,
+                          "executed": executed, "opened_at": int(time.time() * 1000)}, positions_path)
+        return CrossVenueResult(False, "reconcile_required", position_id, executed, logs)
+
     if dry_run:
         executed.extend(sv.execute_trades([spot_trade], spot_market, dry_run=True))
         executed.extend(fv.execute_trades([fut_trade], fut_market, dry_run=True))
@@ -304,9 +333,15 @@ def open_cross_venue_position(
         except Exception as e:
             logs.append(f"{spot_venue_id}: collateral transfer skipped ({e})")
 
-    res_spot = sv.execute_trades([spot_trade], spot_market, dry_run=False)
+    try:
+        res_spot = sv.execute_trades([spot_trade], spot_market, dry_run=False)
+    except Exception as exc:
+        executed.append({"status": "reconcile_required", "error": str(exc)})
+        return require_reconciliation("Spot order outcome unknown", 0.0)
     executed.extend(res_spot)
     if not _filled(res_spot):
+        if not res_spot or res_spot[0].get("status") == "reconcile_required":
+            return require_reconciliation("Spot order outcome unknown or partial", float(res_spot[0].get("exec_qty") or 0) if res_spot else 0.0)
         logs.append(
             f"Spot leg failed: {res_spot[0].get('error') if res_spot else 'no result'}"
         )
@@ -333,7 +368,13 @@ def open_cross_venue_position(
     except Exception:
         pass
     fut_trade["amount_base"] = _floor_qty(exec_qty, fut_mkt["quantity_precision"])
-    res_fut = fv.execute_trades([fut_trade], fut_market, dry_run=False)
+    if abs(fut_trade["amount_base"] - exec_qty) > 1e-12:
+        return require_reconciliation("Spot fill cannot be matched exactly to futures precision", exec_qty)
+    try:
+        res_fut = fv.execute_trades([fut_trade], fut_market, dry_run=False)
+    except Exception as exc:
+        executed.append({"status": "reconcile_required", "error": str(exc)})
+        return require_reconciliation("Futures order outcome unknown", exec_qty)
     executed.extend(res_fut)
 
     if _filled(res_fut):
@@ -360,6 +401,10 @@ def open_cross_venue_position(
         )
         return CrossVenueResult(True, "filled", position_id, executed, logs)
 
+    # Never compensate an order that may have filled or is still pending.
+    if not res_fut or res_fut[0].get("status") == "reconcile_required":
+        return require_reconciliation("Futures order outcome unknown or partial", exec_qty)
+
     # ── Futures leg failed → roll back spot leg ─────────────────────────────────
     logs.append(
         f"Futures leg failed: {res_fut[0].get('error') if res_fut else 'no result'}, rolling back spot leg"
@@ -380,8 +425,14 @@ def open_cross_venue_position(
         f"{spot_venue_id} {rollback['type']} {exec_qty} {base}",
         config,
     )
-    res_rb = sv.execute_trades([rollback], spot_market, dry_run=False)
+    try:
+        res_rb = sv.execute_trades([rollback], spot_market, dry_run=False)
+    except Exception as exc:
+        executed.append({"status": "reconcile_required", "error": str(exc)})
+        return require_reconciliation("Spot compensation outcome unknown", exec_qty)
     executed.extend(res_rb)
+    if not res_rb or res_rb[0].get("status") == "reconcile_required":
+        return require_reconciliation("Spot compensation outcome unknown or partial", exec_qty)
     if _filled(res_rb):
         logs.append("Rollback succeeded, no naked position")
         return CrossVenueResult(False, "rolled_back", "", executed, logs)
@@ -467,8 +518,14 @@ def close_cross_venue_position(
         return CrossVenueResult(True, "simulated", position_id, executed, logs)
 
     # Close futures leg first
-    res_fut = fv.execute_trades([fut_trade], fut_market, dry_run=False)
+    try:
+        res_fut = fv.execute_trades([fut_trade], fut_market, dry_run=False)
+    except Exception as exc:
+        res_fut = [{"status": "reconcile_required", "error": str(exc)}]
     executed.extend(res_fut)
+    if not res_fut or res_fut[0].get("status") == "reconcile_required":
+        _mark_reconcile(position_id, executed, positions_path)
+        return CrossVenueResult(False, "reconcile_required", position_id, executed, ["Futures close uncertain; reconcile manually"])
     if not _filled(res_fut):
         logs.append(
             f"Futures close failed: {res_fut[0].get('error') if res_fut else 'no result'}"
@@ -487,8 +544,14 @@ def close_cross_venue_position(
         except Exception:
             pass
 
-    res_spot = sv.execute_trades([spot_trade], spot_market, dry_run=False)
+    try:
+        res_spot = sv.execute_trades([spot_trade], spot_market, dry_run=False)
+    except Exception as exc:
+        res_spot = [{"status": "reconcile_required", "error": str(exc)}]
     executed.extend(res_spot)
+    if not res_spot or res_spot[0].get("status") == "reconcile_required":
+        _mark_reconcile(position_id, executed, positions_path)
+        return CrossVenueResult(False, "reconcile_required", position_id, executed, ["Spot close uncertain; reconcile manually"])
     if _filled(res_spot):
         logs.append(
             f"Spot leg closed {sv_id} {spot_trade['type']} {spot_trade['amount_base']} {base}"
@@ -514,8 +577,14 @@ def close_cross_venue_position(
         f"{sv_id} {spot_trade['type']} {base} failed; re-opening {fv_id} {reopen['type']} {closed_qty}",
         config,
     )
-    res_rb = fv.execute_trades([reopen], fut_market, dry_run=False)
+    try:
+        res_rb = fv.execute_trades([reopen], fut_market, dry_run=False)
+    except Exception as exc:
+        res_rb = [{"status": "reconcile_required", "error": str(exc)}]
     executed.extend(res_rb)
+    if not res_rb or res_rb[0].get("status") == "reconcile_required":
+        _mark_reconcile(position_id, executed, positions_path)
+        return CrossVenueResult(False, "reconcile_required", position_id, executed, ["Re-hedge outcome uncertain; reconcile manually"])
     if _filled(res_rb):
         logs.append("Re-hedged successfully, position remains open")
         return CrossVenueResult(False, "rolled_back", position_id, executed, logs)

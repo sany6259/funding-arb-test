@@ -5,9 +5,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+# The dashboard can reach other venues and browser wallets; the scoped Bybit
+# testnet integration is intentionally limited to a separate CLI process.
+if "BYBIT_REQUIRE_TESTNET" in os.environ:
+    raise RuntimeError("Bybit testnet mode is CLI-only; dashboard isolation is not implemented")
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
