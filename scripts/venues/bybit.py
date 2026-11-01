@@ -80,6 +80,10 @@ def _sign(payload: str) -> str:
 def _api_call(
     method: str, path: str, params: Optional[dict] = None, body: Optional[dict] = None
 ) -> dict:
+    # This adapter currently has no testnet routing. Fail before reading any
+    # credentials or constructing an authenticated production request.
+    if "BYBIT_REQUIRE_TESTNET" in os.environ:
+        raise RuntimeError("Bybit testnet is not supported; authenticated requests are blocked")
     key, secret = _get_key(), _get_secret()
     if not (key and secret):
         raise RuntimeError(
