@@ -32,7 +32,7 @@ for _p in (str(_ROOT_DIR), str(_SCRIPTS_DIR)):
 # ---------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------
-from server.routes import backtest, positions, scanner, settings  # noqa: E402
+from server.routes import backtest, positions, scanner, settings, demo_connections  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # WebSocket connection manager
@@ -194,6 +194,7 @@ app.include_router(scanner.router, prefix="/api")
 app.include_router(positions.router, prefix="/api")
 app.include_router(backtest.router, prefix="/api")
 app.include_router(settings.router, prefix="/api")
+app.include_router(demo_connections.router, prefix="/api")
 
 
 # ---------------------------------------------------------------------------

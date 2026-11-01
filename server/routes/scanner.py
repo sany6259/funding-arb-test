@@ -521,6 +521,12 @@ async def scanner_trigger(
         _unified_results, \
         _unified_ts
 
+    from core.execution_mode import require_simulation_api
+    try:
+        require_simulation_api()
+    except RuntimeError:
+        return {"success": False, "error": "Сканер недоступен в демо или при неизвестном режиме."}
+
     # When called directly from Python (background loop / scan-all) instead of
     # via HTTP, unsupplied params arrive as FastAPI Query objects — normalize.
     if not isinstance(strategy, str):

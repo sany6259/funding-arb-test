@@ -33,7 +33,8 @@ def _base_url() -> str:
 
 
 def _post(body: dict[str, Any], base_url: str | None = None) -> Any:
-    r = requests.post(f"{base_url or _base_url()}/info", json=body, timeout=20)
+    from core.execution_mode import simulation_request
+    r = simulation_request(requests.post, f"{base_url or _base_url()}/info", json=body, timeout=20)
     r.raise_for_status()
     return r.json()
 

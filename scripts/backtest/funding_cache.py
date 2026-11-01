@@ -20,7 +20,8 @@ def _http_get(url: str, max_retries: int = 5) -> Any:
     for attempt in range(max_retries):
         try:
             req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            from core.execution_mode import simulation_request
+            with simulation_request(urllib.request.urlopen, req, timeout=20) as resp:
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
             # 429/418 = rate-limited, 5xx = exchange-side fault; both should back off and retry.

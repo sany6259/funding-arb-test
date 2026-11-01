@@ -34,10 +34,13 @@ def http_get_json(
     """Fetch JSON from URL with retries and connection pooling."""
     last_err: Optional[Exception] = None
     for attempt in range(retries):
+        from core.execution_mode import LegacyAccessBlocked, simulation_request
         try:
-            resp = _session.get(url, timeout=timeout)
+            resp = simulation_request(_session.get, url, timeout=timeout)
             resp.raise_for_status()
             return resp.json()
+        except LegacyAccessBlocked:
+            raise
         except requests.HTTPError as e:
             last_err = e
             status = e.response.status_code if e.response is not None else 0

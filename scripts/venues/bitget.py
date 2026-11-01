@@ -79,6 +79,11 @@ def _sign(ts: str, method: str, path: str, body: str) -> str:
 def _api_call(
     method: str, path: str, params: Optional[dict] = None, body: Optional[dict] = None
 ) -> dict:
+    if method.upper() != "GET":
+        from core.execution_mode import forbid_orders
+        forbid_orders()
+    from core.execution_mode import require_simulation_api
+    require_simulation_api()
     from urllib.parse import urlencode
 
     # Credential validation: fail immediately on missing credentials; never send private requests with empty credentials (avoids silent failures / account-state misjudgment)
@@ -111,7 +116,8 @@ def _api_call(
         if body_str:
             req.data = body_str.encode()
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            from core.execution_mode import simulation_request
+            with simulation_request(urllib.request.urlopen, req, timeout=15) as resp:
                 return json.loads(resp.read().decode())
         except Exception as e:
             last_err = e

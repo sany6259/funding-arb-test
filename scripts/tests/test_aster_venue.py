@@ -156,7 +156,9 @@ class TestExecution:
         assert results[0]["status"] == "failed"
         assert "Unknown trade type" in results[0]["error"]
 
-    def test_live_requires_credentials(self):
+    def test_live_requires_credentials(self, monkeypatch):
+        from core import execution_mode
+        monkeypatch.setattr(execution_mode, "forbid_orders", lambda: None)
         """Signed calls must fail loudly when ASTER keys are absent."""
         with patch.dict("os.environ", {}, clear=False):
             import os

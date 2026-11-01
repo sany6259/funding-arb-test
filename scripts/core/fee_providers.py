@@ -181,7 +181,8 @@ def _fetch_hyperliquid(symbol: str) -> dict[str, float]:
         data=body,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    from core.execution_mode import simulation_request
+    with simulation_request(urllib.request.urlopen, req, timeout=15) as resp:
         d = _json.loads(resp.read().decode())
 
     taker = float(d.get("userCrossRate", 0.00045) or 0.00045)

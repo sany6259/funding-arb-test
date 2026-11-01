@@ -212,6 +212,8 @@ class LighterVenue:
     # ── execution ──────────────────────────────────────────────────────
 
     def _make_signer(self) -> Any:
+        from core.execution_mode import require_simulation_api
+        require_simulation_api()
         import lighter
 
         private_key = os.environ.get("LIGHTER_API_PRIVATE_KEY", "").strip()
@@ -234,6 +236,8 @@ class LighterVenue:
         is_ask: bool,
         reduce_only: bool,
     ) -> tuple[Any, Any, str | None]:
+        from core.execution_mode import forbid_orders
+        forbid_orders()
         client = self._make_signer()
         try:
             tx, resp, err = await client.create_market_order(

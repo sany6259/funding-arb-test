@@ -218,7 +218,7 @@
         </n-form-item>
 
         <!-- Execution mode selector (only for pure futures with wallet-capable venues) -->
-        <n-form-item v-if="walletCapableVenues.length > 0" :label="t('scanner.openMode')">
+        <n-form-item v-if="false && walletCapableVenues.length > 0" :label="t('scanner.openMode')">
           <n-radio-group v-model:value="openMode" size="small">
             <n-radio value="backend">{{ t('scanner.openModeBackend') }}</n-radio>
             <n-radio value="wallet" :disabled="!walletModeAvailable">{{ t('scanner.openModeWallet') }}</n-radio>
@@ -238,7 +238,7 @@
         </n-form-item>
 
         <n-form-item v-if="openMode === 'backend'" :label="t('scanner.dryRun')">
-          <n-switch v-model:value="openDryRun" />
+          <n-switch v-model:value="openDryRun" disabled />
           <n-text v-if="!openDryRun" type="error" style="margin-left: 12px; font-size: 12px">{{ t('scanner.realOrdersWarning') }}</n-text>
         </n-form-item>
 
@@ -917,12 +917,23 @@ function venueTradeBlock(...venueIds: string[]): string {
   return ''
 }
 
+// The stage-A interface never submits wallet-signed orders.
+function walletOrdersEnabled(): boolean { return false }
+
 async function confirmOpen() {
   const tgt = openTarget.value
   if (!tgt) return
   opening.value = true
   try {
+    if (!openDryRun.value) {
+      message.error('Ордерная торговля отключена на этапе проверки демо.')
+      return
+    }
     if (openMode.value === 'wallet') {
+      if (!walletOrdersEnabled()) {
+        message.error('Подпись кошельком отключена на этапе проверки демо.')
+        return
+      }
       await confirmOpenWallet(tgt)
       return
     }

@@ -55,7 +55,10 @@ def _public_get(url: str, *, timeout: int = 8) -> Any:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or parsed.netloc != "api-testnet.bybit.com":
         raise RuntimeError("Testnet-only public request rejected")
-    response = requests.get(url, timeout=timeout, allow_redirects=False)
+    from core.execution_mode import require_simulation_api
+    require_simulation_api()
+    from core.execution_mode import simulation_request
+    response = simulation_request(requests.get, url, timeout=timeout, allow_redirects=False)
     if response.status_code != 200:
         raise RuntimeError(f"Unexpected Bybit testnet response: {response.status_code}")
     return response.json()
@@ -124,6 +127,11 @@ def _api_call(
         raise ValueError("Invalid Bybit API path")
     if testnet and method != "GET" and os.environ.get("BYBIT_TESTNET_ALLOW_ORDERS") != "1":
         raise RuntimeError("Bybit testnet writes require explicit BYBIT_TESTNET_ALLOW_ORDERS=1")
+    if method.upper() != "GET":
+        from core.execution_mode import forbid_orders
+        forbid_orders()
+    from core.execution_mode import require_simulation_api
+    require_simulation_api()
     if testnet:
         key = os.environ.get("BYBIT_TESTNET_API_KEY") or ""
         secret = os.environ.get("BYBIT_TESTNET_SECRET_KEY") or ""
@@ -167,7 +175,9 @@ def _api_call(
         if body_str:
             req.data = body_str.encode()
         try:
-            with (urllib.request.build_opener(_RejectRedirect()).open(req, timeout=15) if testnet else urllib.request.urlopen(req, timeout=15)) as resp:
+            from core.execution_mode import simulation_request
+            sender = urllib.request.build_opener(_RejectRedirect()).open if testnet else urllib.request.urlopen
+            with simulation_request(sender, req, timeout=15) as resp:
                 data = json.loads(resp.read().decode())
             if data.get("retCode") != 0:
                 raise RuntimeError(

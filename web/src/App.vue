@@ -12,7 +12,6 @@ import {
   NIcon,
   NBadge,
   NText,
-  NTag,
   NMessageProvider,
   NSelect,
   darkTheme, ruRU, enUS, zhCN, zhTW, dateRuRU, dateEnUS, dateZhCN, dateZhTW,
@@ -30,9 +29,11 @@ import {
   CardOutline,
   LockClosedOutline,
 } from '@vicons/ionicons5'
-import { useWebSocket, type TradingMode } from '@/composables/useApi'
+import { useWebSocket } from '@/composables/useApi'
 import { isDemoMode, useDemoSnapshot } from '@/composables/useDemoSnapshot'
 import DemoBanner from '@/components/DemoBanner.vue'
+import DemoConnections from '@/components/DemoConnections.vue'
+import { executionMode, executionModeBusy, refreshExecutionMode, setExecutionMode } from '@/composables/useExecutionMode'
 import i18n, { setLocale, SUPPORTED_LOCALES, type SupportedLocale } from '@/i18n'
 
 const { t } = useI18n()
@@ -109,24 +110,7 @@ const demoUrl = _demoApi?.url ?? ''
 const demoSnapshot = _demoApi?.snapshot ?? null
 const demoLoading = _demoApi?.loading ?? null
 const demoScanTime = computed(() => demoSnapshot?.value?.meta.scan_timestamp ?? null)
-
-const tradingMode = ref<TradingMode | null>(null)
-let tradingModeTimer: ReturnType<typeof setInterval> | null = null
-
-async function fetchTradingMode() {
-  // Demo mode: stub trading mode so the header badge renders cleanly.
-  if (isDemoMode) {
-    tradingMode.value = { mode: 'dry_run', venues: {} }
-    return
-  }
-  try {
-    const response = await fetch('/api/settings/trading-mode')
-    const json = await response.json()
-    if (json.success) tradingMode.value = json.data
-  } catch {
-    // ignore
-  }
-}
+let modeTimer: ReturnType<typeof setInterval> | undefined
 
 function handleMenuUpdate(key: string) {
   router.push(key)
@@ -136,20 +120,19 @@ onMounted(() => {
   // Skip the WebSocket / trading-mode polls in demo mode — there is no
   // backend to talk to, and the static host would 404 on /ws and /api/*.
   if (!isDemoMode) {
+    refreshExecutionMode()
+    modeTimer = setInterval(() => {
+      if (!executionModeBusy.value) void refreshExecutionMode()
+    }, 5000)
     wsConnect()
-    fetchTradingMode()
-    tradingModeTimer = setInterval(fetchTradingMode, 30000)
   } else {
     _demoApi?.ensure()
   }
 })
 
 onUnmounted(() => {
+  if (modeTimer) clearInterval(modeTimer)
   wsDisconnect()
-  if (tradingModeTimer) {
-    clearInterval(tradingModeTimer)
-    tradingModeTimer = null
-  }
 })
 </script>
 
@@ -193,24 +176,18 @@ onUnmounted(() => {
             <n-text class="header-title">{{ t('app.title') }}</n-text>
           </div>
           <div class="header-right">
-            <n-tag
-              v-if="tradingMode?.mode === 'live'"
-              size="small"
-              type="error"
-              :bordered="false"
-              style="margin-right: 4px"
-            >
-              LIVE
-            </n-tag>
-            <n-tag
-              v-else
-              size="small"
-              type="warning"
-              :bordered="false"
-              style="margin-right: 4px"
-            >
-              {{ t('app.tradingMode') }}
-            </n-tag>
+            <n-select
+              :value="executionMode"
+              :disabled="isDemoMode || executionModeBusy || executionMode === 'unavailable'"
+              :options="[
+                { label: 'Симуляция', value: 'simulation' },
+                { label: 'Демо (только проверка)', value: 'demo' },
+                { label: 'Реальная торговля (недоступна)', value: 'live', disabled: true },
+                { label: 'Режим недоступен', value: 'unavailable', disabled: true },
+              ]"
+              size="tiny" style="width: 220px"
+              @update:value="(v: 'simulation' | 'demo') => setExecutionMode(v)"
+            />
             <n-select
               v-model:value="currentLocale"
               :options="SUPPORTED_LOCALES"
@@ -232,7 +209,10 @@ onUnmounted(() => {
             :loading="demoLoading ?? false"
           />
           <n-message-provider>
-            <router-view />
+            <DemoConnections v-if="!isDemoMode && executionMode === 'demo'" />
+            <n-text v-else-if="!isDemoMode && executionMode === 'unavailable'" type="error">Не удалось проверить режим исполнения. Торговля недоступна.</n-text>
+            <n-text v-else-if="route.path === '/dex' || route.path === '/cex'" type="warning">Настройка торговых ключей и кошельков отключена. Для проверки демо-ключей выберите режим «Демо».</n-text>
+            <router-view v-else />
           </n-message-provider>
         </n-layout-content>
       </n-layout>
