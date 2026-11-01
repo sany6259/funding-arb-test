@@ -51,10 +51,10 @@ check_rust() {
 }
 
 install_python_deps() {
-    if ! "$PYTHON" -c "import fastapi, uvicorn, websockets, requests" 2>/dev/null || ! "$PYTHON" -m pip check >/dev/null 2>&1; then
-        info "Installing Python dependencies in .venv..."
-        "$PYTHON" -m pip install -r server/requirements.txt
-    fi
+    # Enforce the declared versions even when all imports happen to succeed.
+    info "Checking Python dependencies in .venv..."
+    "$PYTHON" -m pip install -r server/requirements.txt
+    "$PYTHON" -m pip check || error "Python dependencies are inconsistent."
     "$PYTHON" -c "import fastapi, uvicorn, websockets, requests" || error "Python dependencies are incomplete."
     ok "Python dependencies ready"
 }
