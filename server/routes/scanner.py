@@ -397,7 +397,7 @@ def _scanner_available(strategy: str) -> bool:
 
 @router.get("/scanner/status")
 async def scanner_status(
-    strategy: str = Query("pure", enum=["pure", "carry", "unified"]),
+    strategy: str = Query("pure", pattern="^(pure|carry|unified)$"),
 ):
     """Return current scanner status for the requested strategy."""
     live = False
@@ -436,7 +436,7 @@ async def scanner_status(
 
 @router.get("/scanner/opportunities")
 async def scanner_opportunities(
-    strategy: str = Query("pure", enum=["pure", "carry", "unified"]),
+    strategy: str = Query("pure", pattern="^(pure|carry|unified)$"),
     venues: str | None = Query(
         None, description="Comma-separated venue ids; cache must match to return data"
     ),
@@ -505,7 +505,7 @@ async def scanner_opportunities(
 
 @router.post("/scanner/trigger")
 async def scanner_trigger(
-    strategy: str = Query("pure", enum=["pure", "carry", "unified"]),
+    strategy: str = Query("pure", pattern="^(pure|carry|unified)$"),
     venues: str | None = Query(
         None, description="Comma-separated venue ids (overrides saved scan_venues)"
     ),
