@@ -123,6 +123,16 @@ def _check(venue: str, key: str, secret: str, passphrase: str) -> str | None:
         else:
             headers = {"ACCESS-KEY": key, "ACCESS-SIGN": sig, "ACCESS-TIMESTAMP": ts,
                        "ACCESS-PASSPHRASE": passphrase, "paptrading": "1"}
+    if venue == "okx":
+        import httpx
+        with httpx.Client(timeout=10, follow_redirects=False) as client:
+            response = client.get(base + path, headers=headers)
+            response.raise_for_status()
+            data = response.content
+            if len(data) > 1024 * 1024:
+                raise ValueError("Response too large")
+            return _balance(venue, json.loads(data))
+
     req = urllib.request.Request(base + path, method="GET", headers=headers)
     with urllib.request.build_opener(_NoRedirect()).open(req, timeout=10) as response:
         data = response.read(1024 * 1024 + 1)
