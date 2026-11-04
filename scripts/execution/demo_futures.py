@@ -618,11 +618,17 @@ def _reconcile_closing(path: Path, record: dict[str, Any], risk_limits) -> dict[
                                              confirmation.get('order_id') != known):
                 raise ValueError('Invalid recorded confirmation')
         if state == 'close_prepared':
+            if any('order_id' in leg or 'confirmation' in leg for leg in closing):
+                raise ValueError('Unsubmitted close contains acknowledgement')
             result['reason'] = 'close_not_submitted'
             return result
         if state.startswith('close_1_'):
+            if 'order_id' in closing[1] or 'confirmation' in closing[1]:
+                raise ValueError('Second close could not have been submitted')
             possible = 1
         elif state.startswith('close_2_') or state == 'closed_observed_manual_review':
+            if closing[0].get('confirmation') is None:
+                raise ValueError('First close was not confirmed')
             possible = 2
         else:
             possible = 2 if closing[0].get('confirmation') is not None else 1
@@ -655,6 +661,30 @@ def _reconcile_closing(path: Path, record: dict[str, Any], risk_limits) -> dict[
         raise DemoBlocked('Closing journal unavailable or invalid') from None
 
 
+def _preflight_close(pair: FuturesPair, opening_legs: list[dict[str, Any]],
+                     closing_legs: list[dict[str, Any]], *, risk_limits) -> None:
+    """Validate open positions and exact close requests; keep execution disabled."""
+    from execution import demo_futures_data
+    from execution.demo_futures_preflight import RiskLimits
+
+    if not isinstance(risk_limits, RiskLimits):
+        raise DemoBlocked('Explicit close risk limits required')
+    try:
+        positions_at = demo_futures_data.verify_step(pair, opening_legs, 2, max_age_ms=risk_limits.max_snapshot_age_ms)
+        markets_at = demo_futures_data.verify_close_instruments(
+            pair, opening_legs, closing_legs, max_age_ms=risk_limits.max_snapshot_age_ms,
+            max_slippage_rate=risk_limits.max_slippage_rate)
+        now = int(time.time() * 1000)
+        if any(type(stamp) is not int or stamp > now or now - stamp > risk_limits.max_snapshot_age_ms
+               for stamp in (positions_at, markets_at)):
+            raise demo_futures_data.DemoDataBlocked('Close preflight evidence expired')
+    except demo_futures_data.DemoDataBlocked:
+        raise DemoBlocked('Demo close preflight could not verify positions or orders') from None
+    # Never enable submission until strategy, shared consent, and complete
+    # end-to-end recovery have been integrated and verified together.
+    raise DemoBlocked('Demo execution remains disabled: lifecycle integration is incomplete')
+
+
 def close_pair(*, confirmed: bool = False, close_confirmed: bool = False, risk_limits=None) -> dict[str, Any]:
     """Guarded close skeleton. Remains blocked by the existing preflight gate.
 
@@ -679,13 +709,6 @@ def close_pair(*, confirmed: bool = False, close_confirmed: bool = False, risk_l
         if not locked:
             raise DemoBlocked('Another demo operation is in progress')
         pair, record = _read_open_journal_for_close(path)
-        try:
-            demo_futures_data.verify_step(pair, record['legs'], 2, max_age_ms=risk_limits.max_snapshot_age_ms)
-        except demo_futures_data.DemoDataBlocked:
-            raise DemoBlocked('Open positions cannot be verified; no close sent') from None
-        # This is the same fail-closed gate as opening. It remains closed until
-        # the entire lifecycle and trustworthy strategy limits are complete.
-        _preflight(pair, risk_limits=risk_limits)
         original_ids = {leg['request']['orderLinkId' if leg['venue'] == 'bybit' else 'clOrdId'] for leg in record['legs']}
         close_ids = (uuid.uuid4().hex[:24], uuid.uuid4().hex[:24])
         if len(set(close_ids) | original_ids) != 4:
@@ -697,6 +720,7 @@ def close_pair(*, confirmed: bool = False, close_confirmed: bool = False, risk_l
             qty = leg['request']['qty' if leg['venue'] == 'bybit' else 'sz']
             closing.append({'venue': leg['venue'], 'request': _order_fields(
                 leg['venue'], pair.base, 'buy' if index == 1 else 'sell', qty, client_id, reduce_only=True)})
+        _preflight_close(pair, record['legs'], closing, risk_limits=risk_limits)
         record['closing'] = closing
         record['state'] = 'close_prepared'
         _write_journal(path, record)

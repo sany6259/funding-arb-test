@@ -341,7 +341,97 @@ def collect(venue: str, base: str, side: str, quantity: str) -> VenueSnapshot:
         raise DemoDataBlocked('Demo preflight data incomplete or inconsistent') from None
 
 
-def verify_step(pair: demo.FuturesPair, legs: list[dict[str, Any]], confirmed_count: int, *, max_age_ms: int) -> None:
+def verify_close_instruments(pair: demo.FuturesPair, opening_legs: list[dict[str, Any]],
+                             closing_legs: list[dict[str, Any]], *, max_age_ms: int,
+                             max_slippage_rate: str) -> int:
+    """Validate the exact reduce-only close requests against fresh demo markets."""
+    if (not isinstance(opening_legs, list) or len(opening_legs) != 2 or
+            not isinstance(closing_legs, list) or len(closing_legs) != 2 or
+            type(max_age_ms) is not int or max_age_ms <= 0):
+        raise DemoDataBlocked('Invalid close preflight request')
+    try:
+        pair.validate()
+        max_slippage = _num(max_slippage_rate)
+        if not Decimal(0) <= max_slippage <= Decimal(1):
+            raise ValueError('Invalid slippage limit')
+        now = int(time.time() * 1000)
+        timestamps: list[int] = []
+        identifiers: set[str] = set()
+        for entry in opening_legs:
+            venue = entry['venue']
+            identifiers.add(entry['request']['orderLinkId' if venue == 'bybit' else 'clOrdId'])
+        if len(identifiers) != 2:
+            raise ValueError('Duplicate opening identifiers')
+        for index, opened in enumerate(reversed(opening_legs)):
+            leg = closing_legs[index]
+            venue, original, fields = leg['venue'], opened['request'], leg['request']
+            if venue != opened['venue'] or venue not in ('bybit', 'okx'):
+                raise ValueError('Closing venue mismatch')
+            demo._validate_route(venue, 'POST', None, fields)
+            sym = 'symbol' if venue == 'bybit' else 'instId'
+            qty = 'qty' if venue == 'bybit' else 'sz'
+            client = fields['orderLinkId' if venue == 'bybit' else 'clOrdId']
+            expected_symbol = pair.base + ('USDT' if venue == 'bybit' else '-USDT-SWAP')
+            if (fields.get('reduceOnly') is not True or fields[sym] != expected_symbol or
+                    original[sym] != expected_symbol or fields['side'].lower() == original['side'].lower() or
+                    _num(fields[qty], positive=True) != _num(original[qty], positive=True) or client in identifiers):
+                raise ValueError('Closing order mismatch')
+            identifiers.add(client)
+            inst = read(venue, pair.base, 'instrument')
+            mark = read(venue, pair.base, 'ticker' if venue == 'bybit' else 'mark')
+            book = read(venue, pair.base, 'book')
+            timestamps.extend((inst.started_ms, mark.started_ms, book.started_ms))
+            side = fields['side'].lower()
+            if venue == 'bybit':
+                row = _one(inst.payload['result']['list'], 'symbol', expected_symbol)
+                ticker = _one(mark.payload['result']['list'], 'symbol', expected_symbol)
+                depth = book.payload['result']
+                if (row['contractType'] != 'LinearPerpetual' or row['baseCoin'] != pair.base or
+                        row['quoteCoin'] != 'USDT' or row['settleCoin'] != 'USDT' or
+                        row['status'] != 'Trading' or depth['s'] != expected_symbol):
+                    raise ValueError('Bybit instrument unavailable')
+                lot = row['lotSizeFilter']
+                step, minimum, maximum = (_num(lot[key], positive=True) for key in ('qtyStep', 'minOrderQty', 'maxMktOrderQty'))
+                notional_min = _num(lot['minNotionalValue'], positive=True)
+                contract = Decimal(1)
+                price = _num(ticker['markPrice'], positive=True)
+                timestamps.extend((_stamp(inst.payload['time']), _stamp(mark.payload['time']), _stamp(depth['ts'])))
+                levels = depth['a' if side == 'buy' else 'b']
+            else:
+                row = _one(inst.payload['data'], 'instId', expected_symbol)
+                ticker = _one(mark.payload['data'], 'instId', expected_symbol)
+                depth = _one_scoped(book.payload['data'], 'instId', expected_symbol)
+                if (row['instType'] != 'SWAP' or row['ctType'] != 'linear' or row['ctValCcy'] != pair.base or
+                        row['settleCcy'] != 'USDT' or row['state'] != 'live'):
+                    raise ValueError('OKX instrument unavailable')
+                step, minimum, maximum = (_num(row[key], positive=True) for key in ('lotSz', 'minSz', 'maxMktSz'))
+                with localcontext() as ctx:
+                    ctx.prec = 80
+                    contract = _num(row['ctVal'], positive=True) * _num(row['ctMult'], positive=True)
+                if contract != _num(pair.okx_contract_size, positive=True):
+                    raise ValueError('Contract size changed')
+                price = _num(ticker['markPx'], positive=True)
+                timestamps.extend((_stamp(ticker['ts']), _stamp(depth['ts'])))
+                levels = depth['asks' if side == 'buy' else 'bids']
+                notional_min = Decimal(0)
+            with localcontext() as ctx:
+                ctx.prec = 80
+                amount = _num(fields[qty], positive=True)
+                base_amount = amount * contract
+                if (minimum > maximum or not minimum <= amount <= maximum or amount % step != 0 or
+                        base_amount != _num(pair.base_quantity, positive=True) or base_amount * price < notional_min):
+                    raise ValueError('Close quantity outside instrument limits')
+                if _num(_book_slippage(levels, base_amount, contract, price, side)) > max_slippage:
+                    raise ValueError('Close slippage outside limit')
+        after = int(time.time() * 1000)
+        if after < now or any(stamp > after or after - stamp > max_age_ms for stamp in timestamps):
+            raise ValueError('Stale close market evidence')
+        return min(timestamps)
+    except Exception:
+        raise DemoDataBlocked('Demo close instrument or order evidence unavailable or invalid') from None
+
+
+def verify_step(pair: demo.FuturesPair, legs: list[dict[str, Any]], confirmed_count: int, *, max_age_ms: int) -> int:
     """Read demo executions and both positions; never place or retry an order.
 
     Execution history is paginated with a fixed limit. This routine blocks if
@@ -435,6 +525,7 @@ def verify_step(pair: demo.FuturesPair, legs: list[dict[str, Any]], confirmed_co
         now_after = int(time.time() * 1000)
         if now_after < now or any(stamp > now_after or now_after - stamp > max_age_ms for stamp in all_times):
             raise ValueError('Reconciliation window expired')
+        return min(all_times)
     except Exception:
         raise DemoDataBlocked('Demo reconciliation is uncertain; stop and reconcile manually') from None
 

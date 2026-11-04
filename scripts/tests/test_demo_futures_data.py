@@ -534,6 +534,14 @@ def close_legs():
     ]
 
 
+def unsubmitted_close_legs():
+    legs = close_legs()
+    for leg in legs:
+        leg.pop('order_id')
+        leg.pop('confirmation')
+    return legs
+
+
 def close_fixtures(responses, both=False):
     add_reconciliation_fixtures(responses, both=True)
     # First close is OKX short; the other long remains until its close.
@@ -584,9 +592,87 @@ def test_close_pair_cannot_bypass_preflight_with_open_positions(exchange):
     path = demo._journal_path()
     demo._write_journal(path, record)
     before = path.read_bytes()
-    with pytest.raises(demo.DemoBlocked):
+    with pytest.raises(demo.DemoBlocked, match='lifecycle integration is incomplete'):
         demo.close_pair(confirmed=True, close_confirmed=True, risk_limits=limits())
     assert path.read_bytes() == before and all(req.method == 'GET' for req in calls)
+    paths = {urlsplit(req.full_url).path for req in calls}
+    assert '/v5/market/instruments-info' in paths and '/api/v5/public/instruments' in paths
+    assert '/v5/position/list' in paths and '/api/v5/account/positions' in paths
+
+
+def test_close_preflight_supports_reversed_futures_directions(exchange):
+    responses, calls = exchange
+    add_reconciliation_fixtures(responses, both=True)
+    responses[('bybit', '/v5/position/list')]['result']['list'][0]['side'] = 'Sell'
+    responses[('bybit', '/v5/execution/list')]['result']['list'][0]['side'] = 'Sell'
+    responses[('okx', '/api/v5/account/positions')]['data'][0]['pos'] = '1.8'
+    responses[('okx', '/api/v5/trade/fills')]['data'][0]['side'] = 'buy'
+    record = journal_record(2)
+    record['legs'].reverse()
+    record['legs'][0]['request']['side'] = 'buy'
+    record['legs'][1]['request']['side'] = 'Sell'
+    record['state'] = 'position_reconciliation_required'
+    path = demo._journal_path()
+    demo._write_journal(path, record)
+    before = path.read_bytes()
+    with pytest.raises(demo.DemoBlocked, match='lifecycle integration is incomplete'):
+        demo.close_pair(confirmed=True, close_confirmed=True, risk_limits=limits())
+    assert path.read_bytes() == before and all(req.method == 'GET' for req in calls)
+
+
+def test_close_preflight_rechecks_position_freshness_after_market_reads(exchange, monkeypatch):
+    responses, calls = exchange
+    add_reconciliation_fixtures(responses, both=True)
+    original = data.verify_close_instruments
+    def slow_market(*args, **kwargs):
+        earliest = original(*args, **kwargs)
+        monkeypatch.setattr(demo, 'time', SimpleNamespace(time=lambda: (NOW + 10_000) / 1000))
+        return earliest
+    monkeypatch.setattr(data, 'verify_close_instruments', slow_market)
+    with pytest.raises(demo.DemoBlocked, match='could not verify'):
+        demo._preflight_close(pair(), journal_record(2)['legs'], close_legs(), risk_limits=limits())
+    assert all(req.method == 'GET' for req in calls)
+
+
+@pytest.mark.parametrize('mutate', [
+    lambda f: f[('bybit', '/v5/market/instruments-info')]['result']['list'][0].update(status='Settled'),
+    lambda f: f[('okx', '/api/v5/public/instruments')]['data'][0].update(state='suspend'),
+    lambda f: f[('okx', '/api/v5/public/instruments')]['data'][0].update(ctVal='0.1'),
+    lambda f: f[('bybit', '/v5/market/instruments-info')]['result']['list'][0]['lotSizeFilter'].update(qtyStep='0.007'),
+    lambda f: f[('okx', '/api/v5/public/instruments')]['data'][0].update(maxMktSz='1'),
+    lambda f: f[('bybit', '/v5/market/orderbook')]['result'].update(ts=NOW - 11_000),
+    lambda f: f[('okx', '/api/v5/market/books')]['data'][0].update(asks=[['101000', '10']]),
+    lambda f: f[('okx', '/api/v5/account/positions')]['data'][0].update(pos='1.8'),
+])
+def test_close_pair_rejects_unsafe_positions_and_instrument_data(exchange, mutate):
+    responses, calls = exchange
+    add_reconciliation_fixtures(responses, both=True)
+    mutate(responses)
+    record = journal_record(2)
+    record['state'] = 'position_reconciliation_required'
+    path = demo._journal_path()
+    demo._write_journal(path, record)
+    before = path.read_bytes()
+    with pytest.raises(demo.DemoBlocked, match='could not verify'):
+        demo.close_pair(confirmed=True, close_confirmed=True, risk_limits=limits())
+    assert path.read_bytes() == before and all(req.method == 'GET' for req in calls)
+
+
+@pytest.mark.parametrize('mutate', [
+    lambda legs: legs[0]['request'].pop('reduceOnly'),
+    lambda legs: legs[0]['request'].update(side='sell'),
+    lambda legs: legs[0]['request'].update(sz='0.9'),
+    lambda legs: legs[0]['request'].update(instId='ETH-USDT-SWAP'),
+    lambda legs: legs[0]['request'].update(clOrdId='okxclient'),
+])
+def test_close_preflight_rejects_unsafe_order_intents(exchange, mutate):
+    responses, calls = exchange
+    add_reconciliation_fixtures(responses, both=True)
+    closing = close_legs()
+    mutate(closing)
+    with pytest.raises(demo.DemoBlocked, match='could not verify'):
+        demo._preflight_close(pair(), journal_record(2)['legs'], closing, risk_limits=limits())
+    assert all(req.method == 'GET' for req in calls)
 
 
 def test_close_restart_remains_manual_and_never_retries(exchange):
@@ -594,7 +680,7 @@ def test_close_restart_remains_manual_and_never_retries(exchange):
     _, calls = exchange
     record = journal_record(2)
     record['state'] = 'close_1_submitting'
-    record['closing'] = close_legs()
+    record['closing'] = unsubmitted_close_legs()
     path = demo._journal_path()
     demo._write_journal(path, record)
     before = path.read_bytes()
@@ -638,11 +724,62 @@ def test_close_restart_reads_both_fills_and_zero_positions_without_clearing(exch
     assert path.read_bytes() == original_journal and all(req.method == 'GET' for req in calls)
 
 
+@pytest.mark.parametrize(('state', 'count'), [
+    ('close_prepared', 0),
+    ('close_1_submitting', 1), ('close_1_acknowledged', 1),
+    ('close_1_filled', 1), ('close_1_reconciled', 1),
+    ('close_2_submitting', 2), ('close_2_acknowledged', 2),
+    ('close_2_filled', 2), ('close_2_reconciled', 2),
+    ('close_reconciliation_required', 2), ('closed_observed_manual_review', 2),
+])
+def test_close_restart_states_never_retry_or_clear_journal(exchange, monkeypatch, state, count):
+    responses, calls = exchange
+    close_fixtures(responses, both=count == 2)
+    record = journal_record(2)
+    record['state'] = state
+    record['closing'] = close_legs()
+    if count == 0:
+        for leg in record['closing']:
+            leg.pop('order_id')
+            leg.pop('confirmation')
+    elif count == 1:
+        record['closing'][1].pop('order_id')
+        record['closing'][1].pop('confirmation')
+        if state == 'close_1_submitting':
+            record['closing'][0].pop('order_id')
+            record['closing'][0].pop('confirmation')
+        elif state == 'close_1_acknowledged':
+            record['closing'][0].pop('confirmation')
+    elif state == 'close_2_submitting':
+        record['closing'][1].pop('order_id')
+        record['closing'][1].pop('confirmation')
+    elif state == 'close_2_acknowledged':
+        record['closing'][1].pop('confirmation')
+    path = demo._journal_path()
+    demo._write_journal(path, record)
+    before = path.read_bytes()
+    original_read = data.read
+    def route(venue, base, resource, **kwargs):
+        if resource.startswith('lookup_'):
+            if venue == 'bybit':
+                return data.ReadResult(bybit({'list': [{'orderId': 'bybitcloseorder', 'orderLinkId': 'bybitclose',
+                    'symbol': 'BTCUSDT', 'side': 'Sell', 'orderStatus': 'Filled', 'cumExecQty': '0.018',
+                    'avgPrice': '100000', 'reduceOnly': True}], 'nextPageCursor': ''}), NOW)
+            return data.ReadResult(okx([{'ordId': 'okxcloseorder', 'clOrdId': 'okxclose', 'instId': 'BTC-USDT-SWAP',
+                'side': 'buy', 'state': 'filled', 'accFillSz': '1.8', 'avgPx': '100000', 'reduceOnly': True}]), NOW)
+        return original_read(venue, base, resource, **kwargs)
+    monkeypatch.setattr(data, 'read', route)
+    result = demo.reconcile_pending(confirmed=True, risk_limits=limits())
+    assert result['state'] == 'manual_reconciliation_required' and result['confirmed_closes'] == count
+    assert result['close_evidence_checked'] is (count > 0)
+    assert path.read_bytes() == before and all(req.method == 'GET' for req in calls)
+
+
 def test_close_restart_rejects_changed_reduce_only_intent_before_lookup(exchange):
     _, calls = exchange
     record = journal_record(2)
     record['state'] = 'close_1_submitting'
-    record['closing'] = close_legs()
+    record['closing'] = unsubmitted_close_legs()
     record['closing'][0]['request'].pop('reduceOnly')
     path = demo._journal_path()
     demo._write_journal(path, record)
@@ -652,14 +789,27 @@ def test_close_restart_rejects_changed_reduce_only_intent_before_lookup(exchange
     assert path.read_bytes() == before and not calls
 
 
+@pytest.mark.parametrize('state', ['close_prepared', 'close_1_submitting', 'close_1_acknowledged'])
+def test_close_restart_rejects_impossible_second_acknowledgement(exchange, state):
+    _, calls = exchange
+    record = journal_record(2)
+    record['state'] = state
+    record['closing'] = unsubmitted_close_legs()
+    record['closing'][1]['order_id'] = 'impossibleack'
+    path = demo._journal_path()
+    demo._write_journal(path, record)
+    before = path.read_bytes()
+    with pytest.raises(demo.DemoBlocked, match='Closing journal'):
+        demo.reconcile_pending(confirmed=True, risk_limits=limits())
+    assert path.read_bytes() == before and not calls
+
+
 @pytest.mark.parametrize('state', ['partially_filled', 'live', 'canceled'])
 def test_close_restart_unconfirmed_order_blocks_and_preserves_journal(exchange, state):
     responses, calls = exchange
     record = journal_record(2)
     record['state'] = 'close_1_submitting'
-    record['closing'] = close_legs()
-    record['closing'][0].pop('confirmation')
-    record['closing'][0].pop('order_id')
+    record['closing'] = unsubmitted_close_legs()
     responses[('okx', '/api/v5/trade/order')] = okx([{
         'ordId': 'okxcloseorder', 'clOrdId': 'okxclose', 'instId': 'BTC-USDT-SWAP',
         'side': 'buy', 'state': state, 'accFillSz': '0.9', 'avgPx': '100000', 'reduceOnly': True,
@@ -677,7 +827,7 @@ def test_close_restart_lost_exchange_response_stays_blocked(exchange, monkeypatc
     _, calls = exchange
     record = journal_record(2)
     record['state'] = 'close_1_submitting'
-    record['closing'] = close_legs()
+    record['closing'] = unsubmitted_close_legs()
     path = demo._journal_path()
     demo._write_journal(path, record)
     before = path.read_bytes()
@@ -696,7 +846,7 @@ def test_close_restart_in_new_process_does_not_send_or_change_journal(exchange, 
     execution_mode.set_mode('demo')
     record = journal_record(2)
     record['state'] = 'close_1_submitting'
-    record['closing'] = close_legs()
+    record['closing'] = unsubmitted_close_legs()
     path = demo._journal_path()
     demo._write_journal(path, record)
     original = path.read_bytes()
