@@ -278,6 +278,7 @@ def test_every_private_request_stays_demo_with_explicit_confirmation(monkeypatch
 def test_concurrent_pair_lock_blocks_another_process(monkeypatch):
     import subprocess
     import time
+    from execution.demo_futures_recovery import EvidenceBlocked, inspect_journal
     execution_mode.set_mode('demo')
     exchange = make_mock(monkeypatch)
     monkeypatch.setattr(demo, '_preflight', lambda _: None)
@@ -308,6 +309,8 @@ os.close(fd)
         assert ready.exists()
         with pytest.raises(demo.DemoBlocked, match='Another demo pair'):
             demo.execute_pair(pair(), confirmed=True)
+        with pytest.raises(EvidenceBlocked, match='in use'):
+            inspect_journal()
         assert not exchange.requests and not journal.exists()
     finally:
         release.touch()
@@ -357,6 +360,7 @@ def test_private_transport_cannot_bypass_pair_preflight_or_journal(monkeypatch):
 
 
 def test_acknowledged_order_id_is_durable_before_status_timeout(monkeypatch):
+    from execution.demo_futures_recovery import inspect_journal
     execution_mode.set_mode('demo')
     exchange = make_mock(monkeypatch)
     exchange.fail_on = ('bybit', 'GET')
@@ -365,4 +369,27 @@ def test_acknowledged_order_id_is_durable_before_status_timeout(monkeypatch):
     journal = json.loads(demo._journal_path().read_text())
     assert result['state'] == 'reconciliation_required'
     assert journal['legs'][0]['order_id'] == 'bybit-order-1'
+    summary = inspect_journal()
+    assert summary.state == 'reconciliation_required'
+    assert summary.venues == ('bybit', 'okx') and summary.acknowledged == (True, False)
+    assert not summary.may_open_new_position
     assert [r.method for r in exchange.requests] == ['POST', 'GET']
+
+
+def test_journal_diagnostic_fails_closed_on_corruption(monkeypatch, capsys):
+    from cli import demo_futures_readiness
+    from execution.demo_futures_recovery import EvidenceBlocked, inspect_journal
+    assert inspect_journal().state == 'no_journal'
+    execution_mode.set_mode('demo')
+    path = demo._journal_path()
+    path.write_text('{invalid')
+    path.chmod(0o600)
+    with pytest.raises(EvidenceBlocked):
+        inspect_journal()
+    assert demo_futures_readiness.main(show_journal=True) == 2
+    output = capsys.readouterr().out
+    assert 'journal is busy, unavailable or invalid' in output
+    assert '{invalid' not in output
+    path.write_bytes(b'x' * 1_048_577)
+    with pytest.raises(EvidenceBlocked, match='size'):
+        inspect_journal()
