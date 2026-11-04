@@ -66,14 +66,14 @@ class MockExchange:
             fields = self.orders[venue]
             response = {'retCode': 0, 'result': {'list': [{'orderId': 'bybit-order-1', 'orderLinkId': fields['orderLinkId'],
                 'symbol': fields['symbol'], 'side': fields['side'], 'orderStatus': 'Filled',
-                'cumExecQty': fields['qty'], 'avgPrice': '100000'}]}}
+                'cumExecQty': fields['qty'], 'avgPrice': '100000', 'reduceOnly': fields.get('reduceOnly', False)}]}}
             if self.bad_status and self.bad_venue in (None, venue):
                 response['result']['list'][0].update(self.bad_status)
         else:
             fields = self.orders[venue]
             response = {'code': '0', 'data': [{'ordId': '123456', 'clOrdId': fields['clOrdId'],
                 'instId': fields['instId'], 'side': fields['side'], 'state': 'filled',
-                'accFillSz': fields['sz'], 'avgPx': '100000'}]}
+                'accFillSz': fields['sz'], 'avgPx': '100000', 'reduceOnly': 'true' if fields.get('reduceOnly') is True else 'false'}]}
             if self.bad_status and self.bad_venue in (None, venue):
                 response['data'][0].update(self.bad_status)
         class Response:
@@ -465,6 +465,8 @@ def test_filled_legs_run_readonly_position_reconciliation_in_order(monkeypatch):
                     'size': fields['qty'] if fields else '0', 'side': 'Buy' if fields else ''}]}}
             elif resource == 'orders':
                 obj = {'retCode': 0, 'time': now, 'result': {'list': [], 'nextPageCursor': ''}}
+            elif resource == 'conditional_orders':
+                obj = {'retCode': 0, 'time': now, 'result': {'list': [], 'nextPageCursor': ''}}
             elif resource == 'fills':
                 obj = {'retCode': 0, 'time': now, 'result': {'nextPageCursor': '', 'list': [{
                     'orderLinkId': fields['orderLinkId'], 'orderId': 'bybit-order-1', 'symbol': fields['symbol'],
@@ -475,6 +477,8 @@ def test_filled_legs_run_readonly_position_reconciliation_in_order(monkeypatch):
                 entries = ([{'instId': 'BTC-USDT-SWAP', 'posSide': 'net', 'mgnMode': 'cross', 'pos': '-' + fields['sz']}] if fields else [])
                 obj = {'code': '0', 'data': entries}
             elif resource == 'orders':
+                obj = {'code': '0', 'data': []}
+            elif resource.startswith('algo_'):
                 obj = {'code': '0', 'data': []}
             elif resource == 'fills':
                 obj = {'code': '0', 'data': [{'clOrdId': fields['clOrdId'], 'ordId': '123456',
@@ -499,3 +503,24 @@ def test_duplicate_generated_client_order_ids_block_before_journal_or_network(mo
     with pytest.raises(demo.DemoBlocked, match='Duplicate client'):
         demo.execute_pair(pair(), confirmed=True)
     assert not exchange.requests and not demo._journal_path().exists()
+
+
+@pytest.mark.parametrize('venue,side', [('bybit', 'sell'), ('okx', 'buy')])
+def test_close_status_must_confirm_reduce_only(monkeypatch, venue, side):
+    fields = demo._order_fields(venue, 'BTC', side, '0.01', 'closeclient', reduce_only=True)
+    if venue == 'bybit':
+        ack = {'retCode': 0, 'result': {'orderId': 'order123'}}
+        status = {'retCode': 0, 'result': {'list': [{'orderId': 'order123', 'orderLinkId': 'closeclient',
+            'symbol': 'BTCUSDT', 'side': 'Sell', 'orderStatus': 'Filled', 'cumExecQty': '0.01',
+            'avgPrice': '100000', 'reduceOnly': False}]}}
+    else:
+        ack = {'code': '0', 'data': [{'sCode': '0', 'ordId': 'order123'}]}
+        status = {'code': '0', 'data': [{'ordId': 'order123', 'clOrdId': 'closeclient',
+            'instId': 'BTC-USDT-SWAP', 'side': 'buy', 'state': 'filled', 'accFillSz': '0.01',
+            'avgPx': '100000', 'reduceOnly': 'false'}]}
+    replies = iter((ack, status))
+    monkeypatch.setattr(demo, '_request', lambda *args, **kwargs: next(replies))
+    acknowledgements = []
+    with pytest.raises(demo.ReconciliationRequired):
+        demo._create_and_confirm(venue, fields, True, acknowledgements.append)
+    assert acknowledgements == ['order123']

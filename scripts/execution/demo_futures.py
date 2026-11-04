@@ -258,6 +258,9 @@ def _create_and_confirm(venue: str, fields: dict[str, Any], confirmed: bool, on_
                      order['state'] == 'filled')
             filled, price = _number(order['accFillSz']), _number(order['avgPx'])
             expected = _quantity(fields['sz'])
+        reduce_only = order.get('reduceOnly')
+        if fields.get('reduceOnly') is True and not (reduce_only is True or reduce_only == 'true'):
+            raise ValueError('reduce-only not confirmed')
         if not valid or filled != expected or price <= 0:
             raise ValueError('not fully filled')
     except (KeyError, IndexError, TypeError, ValueError, ReconciliationRequired):
@@ -406,9 +409,8 @@ def execute_pair(pair: FuturesPair, *, confirmed: bool = False, risk_limits=None
 def reconcile_pending(*, confirmed: bool = False, risk_limits=None) -> dict[str, Any]:
     """Read-only post-restart check; never retries, clears a journal or closes.
 
-    A crash before an order confirmation remains manual-only because lookup by
-    client ID and complete history reconciliation are not yet implemented.
-    Even a matching snapshot does not authorize a subsequent order.
+    A crash before an order confirmation remains manual-only even when bounded
+    lookup succeeds. A matching snapshot never authorizes a subsequent order.
     """
     import stat
     from execution import demo_futures_data
@@ -442,12 +444,19 @@ def reconcile_pending(*, confirmed: bool = False, risk_limits=None) -> dict[str,
         record = json.loads(raw)
         states = {'prepared', 'leg_1_submitting', 'leg_1_acknowledged', 'leg_1_filled', 'leg_1_reconciled',
                   'leg_2_submitting', 'leg_2_acknowledged', 'leg_2_filled', 'leg_2_reconciled',
-                  'reconciliation_required', 'position_reconciliation_required'}
+                  'reconciliation_required', 'position_reconciliation_required', 'close_prepared',
+                  'close_1_submitting', 'close_1_acknowledged', 'close_1_filled', 'close_1_reconciled',
+                  'close_2_submitting', 'close_2_acknowledged', 'close_2_filled', 'close_2_reconciled',
+                  'close_reconciliation_required', 'closed_observed_manual_review'}
         if (not isinstance(record, dict) or type(record.get('version')) is not int or record['version'] != 1 or
                 record.get('state') not in states or not isinstance(record.get('id'), str) or
                 not re.fullmatch(r'[a-f0-9]{32}', record['id']) or not isinstance(record.get('legs'), list) or
                 len(record['legs']) != 2):
             raise DemoBlocked('Pending journal invalid')
+        if record['state'].startswith(('close_', 'closed_')):
+            # Closing-order recovery must not be confused with opening fills.
+            return {'state': 'manual_reconciliation_required', 'confirmed_legs': 0,
+                    'confirmed_leg_evidence_checked': False}
         legs = record['legs']
         if any(not isinstance(leg, dict) or leg.get('venue') not in _VENUES or not isinstance(leg.get('request'), dict) for leg in legs):
             raise DemoBlocked('Pending journal invalid')
@@ -469,10 +478,29 @@ def reconcile_pending(*, confirmed: bool = False, risk_limits=None) -> dict[str,
                 okx_leg['request']['instId'] != pair.base + '-USDT-SWAP'):
             raise DemoBlocked('Pending journal invalid')
         count = 0
-        for leg in legs:
+        for index, leg in enumerate(legs):
             confirmation = leg.get('confirmation')
             if confirmation is None:
-                break
+                state = record['state']
+                potentially_submitted = (
+                    (index == 0 and state in ('leg_1_submitting', 'leg_1_acknowledged', 'reconciliation_required')) or
+                    (index == 1 and state in ('leg_2_submitting', 'leg_2_acknowledged', 'reconciliation_required'))
+                )
+                if not potentially_submitted:
+                    break
+                known_id = leg.get('order_id')
+                if known_id is not None and (not isinstance(known_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', known_id)):
+                    raise DemoBlocked('Pending journal invalid')
+                try:
+                    confirmation = demo_futures_data.lookup_confirmation(
+                        leg['venue'], pair.base, leg['request'], order_id=known_id,
+                        max_age_ms=risk_limits.max_snapshot_age_ms)
+                except demo_futures_data.DemoDataBlocked:
+                    break  # No inference from a missing or ambiguous lookup.
+                # Only the in-memory copy is enriched; the durable intent is
+                # unchanged and continues to block all future entries.
+                leg['confirmation'] = confirmation
+                leg['order_id'] = confirmation['order_id']
             if (not isinstance(confirmation, dict) or confirmation.get('venue') != leg['venue'] or
                     confirmation.get('order_id') != leg.get('order_id') or
                     not isinstance(leg.get('order_id'), str) or
@@ -500,3 +528,134 @@ def reconcile_pending(*, confirmed: bool = False, risk_limits=None) -> dict[str,
         if locked:
             unlock(lock_fd)
         os.close(lock_fd)
+
+
+def _read_open_journal_for_close(path: Path) -> tuple[FuturesPair, dict[str, Any]]:
+    """Load only a fully confirmed opening journal; reject old/ambiguous data."""
+    import stat
+    try:
+        if path.is_symlink():
+            raise ValueError('symlink')
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        with os.fdopen(fd, 'rb') as file:
+            info = os.fstat(file.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_size > 1_048_576 or
+                    (os.name != 'nt' and (info.st_uid != os.geteuid() or info.st_mode & 0o077))):
+                raise ValueError('unsafe journal')
+            raw = file.read(1_048_577)
+        if len(raw) > 1_048_576:
+            raise ValueError('unsafe journal')
+        record = json.loads(raw)
+        if (not isinstance(record, dict) or type(record.get('version')) is not int or record['version'] != 1 or
+                record.get('state') != 'position_reconciliation_required' or not isinstance(record.get('id'), str) or
+                not re.fullmatch(r'[a-f0-9]{32}', record['id']) or not isinstance(record.get('legs'), list) or
+                len(record['legs']) != 2):
+            raise ValueError('unconfirmed opening')
+        legs = record['legs']
+        if any(not isinstance(leg, dict) or leg.get('venue') not in _VENUES or not isinstance(leg.get('request'), dict) for leg in legs):
+            raise ValueError('invalid legs')
+        if {legs[0]['venue'], legs[1]['venue']} != _VENUES:
+            raise ValueError('invalid venues')
+        for index, leg in enumerate(legs):
+            fields, confirmation = leg['request'], leg.get('confirmation')
+            _validate_route(leg['venue'], 'POST', None, fields)
+            if (fields.get('reduceOnly') is not None or fields['side'].lower() != ('buy' if index == 0 else 'sell') or
+                    not isinstance(confirmation, dict) or confirmation.get('venue') != leg['venue'] or
+                    confirmation.get('order_id') != leg.get('order_id') or not isinstance(leg.get('order_id'), str) or
+                    not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', leg['order_id']) or
+                    _quantity(confirmation.get('filled_qty')) != _quantity(fields['qty' if leg['venue'] == 'bybit' else 'sz']) or
+                    _quantity(confirmation.get('avg_price')) <= 0):
+                raise ValueError('opening confirmation mismatch')
+        bybit = next(leg for leg in legs if leg['venue'] == 'bybit')
+        okx = next(leg for leg in legs if leg['venue'] == 'okx')
+        if bybit['request']['orderLinkId'] == okx['request']['clOrdId']:
+            raise ValueError('duplicate client ids')
+        pair = FuturesPair(record['base'], legs[0]['venue'], legs[1]['venue'], bybit['request']['qty'],
+                           okx['request']['sz'], record['okx_contract_size'])
+        pair.validate()
+        if (bybit['request']['symbol'] != pair.base + 'USDT' or
+                okx['request']['instId'] != pair.base + '-USDT-SWAP'):
+            raise ValueError('instrument mismatch')
+        return pair, record
+    except Exception:
+        raise DemoBlocked('Opening journal unavailable, ambiguous or not fully confirmed') from None
+
+
+def close_pair(*, confirmed: bool = False, close_confirmed: bool = False, risk_limits=None) -> dict[str, Any]:
+    """Guarded close skeleton. Remains blocked by the existing preflight gate.
+
+    No retry or automatic journal deletion occurs. This is not a supported
+    trading entry point while the blocking gate remains in place.
+    """
+    from execution import demo_futures_data
+    from execution.demo_futures_preflight import RiskLimits
+
+    _permit(confirmed)
+    if close_confirmed is not True or not isinstance(risk_limits, RiskLimits):
+        raise DemoBlocked('Explicit close confirmation and risk limits are required')
+    if execution_mode.current_mode() != 'demo':
+        raise DemoBlocked('Demo mode is required')
+    path = _journal_path()
+    if not path.parent.is_dir():
+        raise DemoBlocked('Opening journal unavailable')
+    fd = os.open(path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    locked = False
+    try:
+        locked = lock_exclusive(fd, blocking=False)
+        if not locked:
+            raise DemoBlocked('Another demo operation is in progress')
+        pair, record = _read_open_journal_for_close(path)
+        try:
+            demo_futures_data.verify_step(pair, record['legs'], 2, max_age_ms=risk_limits.max_snapshot_age_ms)
+        except demo_futures_data.DemoDataBlocked:
+            raise DemoBlocked('Open positions cannot be verified; no close sent') from None
+        # This is the same fail-closed gate as opening. It remains closed until
+        # the entire lifecycle and trustworthy strategy limits are complete.
+        _preflight(pair, risk_limits=risk_limits)
+        original_ids = {leg['request']['orderLinkId' if leg['venue'] == 'bybit' else 'clOrdId'] for leg in record['legs']}
+        close_ids = (uuid.uuid4().hex[:24], uuid.uuid4().hex[:24])
+        if len(set(close_ids) | original_ids) != 4:
+            raise DemoBlocked('Duplicate client order identifiers')
+        # Close the recorded short first, then long; both are reduce-only.
+        closing = []
+        for index, client_id in ((1, close_ids[0]), (0, close_ids[1])):
+            leg = record['legs'][index]
+            qty = leg['request']['qty' if leg['venue'] == 'bybit' else 'sz']
+            closing.append({'venue': leg['venue'], 'request': _order_fields(
+                leg['venue'], pair.base, 'buy' if index == 1 else 'sell', qty, client_id, reduce_only=True)})
+        record['closing'] = closing
+        record['state'] = 'close_prepared'
+        _write_journal(path, record)
+        token = _PAIR_ACTIVE.set(True)
+        try:
+            for index, leg in enumerate(closing):
+                record['state'] = f'close_{index + 1}_submitting'
+                _write_journal(path, record)
+                confirmed_closes = index
+                try:
+                    def save_ack(order_id: str) -> None:
+                        leg['order_id'] = order_id
+                        record['state'] = f'close_{index + 1}_acknowledged'
+                        _write_journal(path, record)
+                    result = _create_and_confirm(leg['venue'], leg['request'], confirmed, save_ack)
+                    leg['confirmation'] = result
+                    confirmed_closes = index + 1
+                    record['state'] = f'close_{index + 1}_filled'
+                    _write_journal(path, record)
+                    demo_futures_data.verify_close_step(pair, record['legs'], closing, index + 1,
+                                                        max_age_ms=risk_limits.max_snapshot_age_ms)
+                except Exception:
+                    record['state'] = 'close_reconciliation_required'
+                    _write_journal(path, record)
+                    return {'state': 'close_reconciliation_required', 'confirmed_closes': confirmed_closes}
+                record['state'] = f'close_{index + 1}_reconciled'
+                _write_journal(path, record)
+            record['state'] = 'closed_observed_manual_review'
+            _write_journal(path, record)
+            return {'state': record['state'], 'confirmed_closes': 2}
+        finally:
+            _PAIR_ACTIVE.reset(token)
+    finally:
+        if locked:
+            unlock(fd)
+        os.close(fd)
