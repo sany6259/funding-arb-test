@@ -269,8 +269,8 @@ def inspect_journal() -> JournalSummary:
             if len(raw) > 1_048_576:
                 raise EvidenceBlocked('invalid journal size')
         data = json.loads(raw)
-        states = {'prepared', 'leg_1_submitting', 'leg_1_acknowledged', 'leg_1_filled',
-                  'leg_2_submitting', 'leg_2_acknowledged', 'leg_2_filled',
+        states = {'prepared', 'leg_1_submitting', 'leg_1_acknowledged', 'leg_1_filled', 'leg_1_reconciled',
+                  'leg_2_submitting', 'leg_2_acknowledged', 'leg_2_filled', 'leg_2_reconciled',
                   'reconciliation_required', 'position_reconciliation_required'}
         if (not isinstance(data, dict) or type(data.get('version')) is not int or data.get('version') != 1 or data.get('state') not in states or
                 not isinstance(data.get('id'), str) or not re.fullmatch(r'[a-f0-9]{32}', data['id']) or

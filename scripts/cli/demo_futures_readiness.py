@@ -34,7 +34,7 @@ def main(*, show_journal: bool = False) -> int:
     try:
         _preflight(FuturesPair('BTC', 'bybit', 'okx', '0.01', '0.1', '0.1'))
     except DemoBlocked:
-        print('NOT READY: demo order preflight and position reconciliation are not implemented')
+        print('NOT READY: trusted risk policy, recovery and safe close are incomplete')
         return 2
     # Do not equate preflight alone with permission to trade.
     print('NOT READY: demo order execution requires a separate safety review')

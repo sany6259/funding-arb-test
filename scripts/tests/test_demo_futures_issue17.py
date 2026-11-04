@@ -20,6 +20,8 @@ for path in (ROOT, ROOT / 'scripts'):
 from core import execution_mode, demo_credentials
 from execution import demo_futures as demo
 
+REAL_RECONCILE = demo._reconcile_step
+
 
 @pytest.fixture(autouse=True)
 def isolate(monkeypatch, tmp_path):
@@ -28,6 +30,9 @@ def isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(demo_credentials, 'load', lambda venue, environment: {
         'key': f'{venue}-demo-key', 'secret': f'{venue}-demo-secret', 'passphrase': 'okx-demo-pass'})
     monkeypatch.setattr(demo.urllib.request, 'build_opener', lambda *args: pytest.fail('network was not mocked'))
+    # Legacy transport/journal tests stub exchange reconciliation explicitly;
+    # its real read-only behavior is exercised in test_demo_futures_data.py.
+    monkeypatch.setattr(demo, '_reconcile_step', lambda *args: None)
     monkeypatch.setenv('FARB_ENABLE_DEMO_ORDERS', '1')
     for name in ('FARB_DRY_RUN', 'FARB_LIVE', 'DCA_LIVE', 'BYBIT_REQUIRE_TESTNET', 'BYBIT_API_KEY', 'BYBIT_TESTNET_API_KEY', 'OKX_API_KEY'):
         monkeypatch.delenv(name, raising=False)
@@ -393,3 +398,104 @@ def test_journal_diagnostic_fails_closed_on_corruption(monkeypatch, capsys):
     path.write_bytes(b'x' * 1_048_577)
     with pytest.raises(EvidenceBlocked, match='size'):
         inspect_journal()
+
+
+def test_reconciliation_failure_after_first_fill_blocks_second_leg(monkeypatch):
+    execution_mode.set_mode('demo')
+    exchange = make_mock(monkeypatch)
+    monkeypatch.setattr(demo, '_preflight', lambda _: None)
+    def fail(*args):
+        raise demo.ReconciliationRequired('position unknown')
+    monkeypatch.setattr(demo, '_reconcile_step', fail)
+    result = demo.execute_pair(pair(), confirmed=True)
+    assert result['state'] == 'reconciliation_required' and result['confirmed_legs'] == 1
+    assert [req.method for req in exchange.requests] == ['POST', 'GET']
+    journal = json.loads(demo._journal_path().read_text())
+    assert journal['state'] == 'reconciliation_required' and journal['legs'][0]['confirmation']['order_id'] == 'bybit-order-1'
+
+
+def test_reconciliation_hook_runs_between_futures_legs(monkeypatch):
+    execution_mode.set_mode('demo')
+    exchange = make_mock(monkeypatch)
+    monkeypatch.setattr(demo, '_preflight', lambda _: None)
+    calls = []
+    def check(pair_value, legs, confirmed, risk_limits):
+        calls.append((confirmed, len(exchange.requests)))
+    monkeypatch.setattr(demo, '_reconcile_step', check)
+    result = demo.execute_pair(pair(), confirmed=True)
+    assert result['state'] == 'position_reconciliation_required'
+    assert calls == [(1, 2), (2, 4)]
+
+
+@pytest.mark.parametrize('venue, side', [('bybit', 'sell'), ('okx', 'buy')])
+def test_reduce_only_futures_fields_cannot_be_silently_disabled(monkeypatch, venue, side):
+    exchange = make_mock(monkeypatch)
+    fields = demo._order_fields(venue, 'BTC', side, '0.01', 'clientclose', reduce_only=True)
+    assert fields['reduceOnly'] is True
+    demo._validate_route(venue, 'POST', None, fields)
+    fields['reduceOnly'] = False
+    with pytest.raises(demo.DemoBlocked):
+        demo._validate_route(venue, 'POST', None, fields)
+    with pytest.raises(demo.DemoBlocked):
+        demo._order_fields(venue, 'BTC', side, '0.01', 'clientclose', reduce_only='true')
+    assert not exchange.requests
+
+
+def test_filled_legs_run_readonly_position_reconciliation_in_order(monkeypatch):
+    # Existing preflight stays blocked in production. Here only, it is replaced
+    # to exercise the order and reconciliation sequence with fake data.
+    import time
+    from execution import demo_futures_data
+    from execution.demo_futures_preflight import RiskLimits
+    execution_mode.set_mode('demo')
+    exchange = make_mock(monkeypatch)
+    monkeypatch.setattr(demo, '_preflight', lambda *args, **kwargs: None)
+    # The module fixture stubs reconciliation for old transport tests; restore
+    # the actual hook using the underlying source function captured below.
+    real_reconcile = REAL_RECONCILE
+    monkeypatch.setattr(demo, '_reconcile_step', real_reconcile)
+    reads = []
+    def read(venue, base, resource):
+        now = int(time.time() * 1000)
+        reads.append((venue, resource, len(exchange.requests)))
+        fields = exchange.orders.get(venue)
+        if venue == 'bybit':
+            if resource == 'position':
+                obj = {'retCode': 0, 'time': now, 'result': {'list': [{'symbol': 'BTCUSDT', 'positionIdx': 0,
+                    'size': fields['qty'] if fields else '0', 'side': 'Buy' if fields else ''}]}}
+            elif resource == 'orders':
+                obj = {'retCode': 0, 'time': now, 'result': {'list': [], 'nextPageCursor': ''}}
+            elif resource == 'fills':
+                obj = {'retCode': 0, 'time': now, 'result': {'nextPageCursor': '', 'list': [{
+                    'orderLinkId': fields['orderLinkId'], 'orderId': 'bybit-order-1', 'symbol': fields['symbol'],
+                    'side': fields['side'], 'execId': 'bybitexec', 'execQty': fields['qty']}]}}
+            else: raise AssertionError('unexpected resource')
+        else:
+            if resource == 'position':
+                entries = ([{'instId': 'BTC-USDT-SWAP', 'posSide': 'net', 'mgnMode': 'cross', 'pos': '-' + fields['sz']}] if fields else [])
+                obj = {'code': '0', 'data': entries}
+            elif resource == 'orders':
+                obj = {'code': '0', 'data': []}
+            elif resource == 'fills':
+                obj = {'code': '0', 'data': [{'clOrdId': fields['clOrdId'], 'ordId': '123456',
+                    'instId': fields['instId'], 'side': fields['side'], 'tradeId': 'okxexec', 'fillSz': fields['sz']}]}
+            else: raise AssertionError('unexpected resource')
+        return demo_futures_data.ReadResult(obj, now)
+    monkeypatch.setattr(demo_futures_data, 'read', read)
+    risk = RiskLimits(10_000, 60_000, 30_000, 600_000, 5_000, '10000', '3', '1', '0.001', '0.001', '0.1', '0')
+    result = demo.execute_pair(pair(), confirmed=True, risk_limits=risk)
+    assert result['state'] == 'position_reconciliation_required' and result['confirmed_legs'] == 2
+    assert [req.method for req in exchange.requests] == ['POST', 'GET', 'POST', 'GET']
+    assert any(item == ('bybit', 'fills', 2) for item in reads)
+    assert any(item == ('okx', 'fills', 4) for item in reads)
+
+
+def test_duplicate_generated_client_order_ids_block_before_journal_or_network(monkeypatch):
+    from types import SimpleNamespace
+    execution_mode.set_mode('demo')
+    exchange = make_mock(monkeypatch)
+    monkeypatch.setattr(demo, '_preflight', lambda _: None)
+    monkeypatch.setattr(demo.uuid, 'uuid4', lambda: SimpleNamespace(hex='a' * 32))
+    with pytest.raises(demo.DemoBlocked, match='Duplicate client'):
+        demo.execute_pair(pair(), confirmed=True)
+    assert not exchange.requests and not demo._journal_path().exists()

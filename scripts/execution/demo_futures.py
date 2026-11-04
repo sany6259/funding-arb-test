@@ -105,7 +105,8 @@ def _validate_route(venue: str, method: str, params: dict[str, str] | None, body
     if method == 'POST':
         expected = ({'category', 'symbol', 'side', 'orderType', 'qty', 'orderLinkId', 'positionIdx'}
                     if venue == 'bybit' else {'instId', 'tdMode', 'side', 'posSide', 'ordType', 'sz', 'clOrdId'})
-        if params or not isinstance(body, dict) or set(body) != expected:
+        if (params or not isinstance(body, dict) or set(body) not in (expected, expected | {'reduceOnly'}) or
+                ('reduceOnly' in body and body['reduceOnly'] is not True)):
             raise DemoBlocked('Unsupported demo order')
         if venue == 'bybit':
             valid = (body['category'] == 'linear' and body['orderType'] == 'Market' and
@@ -202,18 +203,24 @@ class FuturesPair:
             raise DemoBlocked('Futures quantities do not match')
 
 
-def _order_fields(venue: str, base: str, side: str, qty: str, client_id: str) -> dict[str, str]:
+def _order_fields(venue: str, base: str, side: str, qty: str, client_id: str, *, reduce_only: bool = False) -> dict[str, Any]:
     if venue not in _VENUES or side not in ('buy', 'sell'):
         raise DemoBlocked('Unsupported demo futures leg')
+    if type(reduce_only) is not bool:
+        raise DemoBlocked('Invalid reduce-only flag')
     qty = format(_quantity(qty), 'f')
     if venue == 'bybit':
-        return {'category': 'linear', 'symbol': base + 'USDT', 'side': side.title(), 'orderType': 'Market',
-                'qty': qty, 'orderLinkId': client_id, 'positionIdx': 0}
-    return {'instId': base + '-USDT-SWAP', 'tdMode': 'cross', 'side': side, 'posSide': 'net',
-            'ordType': 'market', 'sz': qty, 'clOrdId': client_id}
+        fields: dict[str, Any] = {'category': 'linear', 'symbol': base + 'USDT', 'side': side.title(), 'orderType': 'Market',
+                                  'qty': qty, 'orderLinkId': client_id, 'positionIdx': 0}
+    else:
+        fields = {'instId': base + '-USDT-SWAP', 'tdMode': 'cross', 'side': side, 'posSide': 'net',
+                  'ordType': 'market', 'sz': qty, 'clOrdId': client_id}
+    if reduce_only:
+        fields['reduceOnly'] = True
+    return fields
 
 
-def _create_and_confirm(venue: str, fields: dict[str, str], confirmed: bool, on_ack) -> dict[str, str]:
+def _create_and_confirm(venue: str, fields: dict[str, Any], confirmed: bool, on_ack) -> dict[str, str]:
     ack = _request(venue, 'POST', None, fields, confirmed)
     try:
         if venue == 'bybit':
@@ -258,16 +265,48 @@ def _create_and_confirm(venue: str, fields: dict[str, str], confirmed: bool, on_
     return {'venue': venue, 'order_id': order_id, 'filled_qty': str(filled), 'avg_price': str(price)}
 
 
-def _preflight(pair: FuturesPair) -> None:
-    # The legacy pure-futures executor has fail-open balance checks and can
-    # submit legs in parallel. Do not reuse it for demo orders. Exchange-backed
-    # checks of contract metadata, quantity steps, funding, margin, leverage,
-    # fees and current positions must be implemented before this gate opens.
-    raise DemoBlocked('Exchange preflight is not implemented; demo pair execution is disabled')
+def _preflight(pair: FuturesPair, *, risk_limits=None) -> None:
+    """Collect isolated demo evidence and evaluate it; keep execution blocked.
+
+    Exchange-backed recovery, safe close and trusted strategy limits are still
+    missing. A successful read-only evaluation must never become permission to
+    submit orders until the whole lifecycle is integrated and verified.
+    """
+    if risk_limits is None:
+        raise DemoBlocked('Demo preflight requires explicit risk limits; execution remains disabled')
+    from execution import demo_futures_data
+    from execution.demo_futures_preflight import PreflightBlocked, RiskLimits, evaluate
+    if not isinstance(risk_limits, RiskLimits):
+        raise DemoBlocked('Demo preflight risk limits are invalid')
+    try:
+        long = demo_futures_data.collect(pair.long_venue, pair.base, 'buy', pair.base_quantity)
+        short = demo_futures_data.collect(pair.short_venue, pair.base, 'sell', pair.base_quantity)
+        checked = evaluate(pair.base, pair.base_quantity, long, short, risk_limits, now_ms=int(time.time() * 1000))
+        if (_quantity(checked.base_quantity) != _quantity(pair.base_quantity) or
+                _quantity(checked.okx_contracts) != _quantity(pair.okx_contracts) or
+                _quantity(checked.okx_contract_size) != _quantity(pair.okx_contract_size)):
+            raise ValueError('Requested quantities do not match checked contract rules')
+    except (demo_futures_data.DemoDataBlocked, PreflightBlocked, ValueError):
+        raise DemoBlocked('Demo preflight could not validate current evidence') from None
+    # Intentionally fail closed even with valid quotes. Do not bypass until
+    # position reconciliation, safe close and strategy-level limits are ready.
+    raise DemoBlocked('Demo execution remains disabled: reconciliation and safe close are incomplete')
 
 
 def _journal_path() -> Path:
     return execution_mode._directory() / 'demo-futures-intent.json'
+
+
+def _reconcile_step(pair: FuturesPair, legs: list[dict[str, Any]], confirmed_count: int, risk_limits) -> None:
+    """Check exchange executions and both positions before another leg."""
+    from execution import demo_futures_data
+    from execution.demo_futures_preflight import RiskLimits
+    if not isinstance(risk_limits, RiskLimits):
+        raise ReconciliationRequired('Explicit reconciliation limits required')
+    try:
+        demo_futures_data.verify_step(pair, legs, confirmed_count, max_age_ms=risk_limits.max_snapshot_age_ms)
+    except demo_futures_data.DemoDataBlocked:
+        raise ReconciliationRequired('Demo position or execution state is uncertain') from None
 
 
 def _write_journal(path: Path, value: dict[str, Any]) -> None:
@@ -289,11 +328,12 @@ def _write_journal(path: Path, value: dict[str, Any]) -> None:
             os.unlink(temporary)
 
 
-def execute_pair(pair: FuturesPair, *, confirmed: bool = False) -> dict[str, Any]:
+def execute_pair(pair: FuturesPair, *, confirmed: bool = False, risk_limits=None) -> dict[str, Any]:
     """Sequential two-futures skeleton; intentionally blocked by preflight.
 
-    Tests replace only the unfinished preflight and mock all exchange I/O.
-    No automatic retry, compensation or reconciliation is attempted.
+    Some offline tests replace the blocking preflight and mock all exchange I/O.
+    Bounded read-only reconciliation is attempted after each confirmed fill;
+    there is no automatic retry, compensation or journal clearance.
     """
     pair.validate()
     _permit(confirmed)
@@ -309,15 +349,21 @@ def execute_pair(pair: FuturesPair, *, confirmed: bool = False) -> dict[str, Any
         # blocks new trades until an operator reconciles it outside this module.
         if path.exists() or path.is_symlink():
             raise DemoBlocked('Existing demo intent requires manual reconciliation')
-        _preflight(pair)
+        if risk_limits is None:
+            _preflight(pair)
+        else:
+            _preflight(pair, risk_limits=risk_limits)
         position_id = uuid.uuid4().hex
         long_id, short_id = uuid.uuid4().hex[:24], uuid.uuid4().hex[:24]
+        if long_id == short_id:
+            raise DemoBlocked('Duplicate client order identifiers')
         def qty_for(venue: str) -> str:
             return pair.base_quantity if venue == 'bybit' else pair.okx_contracts
         legs = [_order_fields(pair.long_venue, pair.base, 'buy', qty_for(pair.long_venue), long_id),
                 _order_fields(pair.short_venue, pair.base, 'sell', qty_for(pair.short_venue), short_id)]
         record: dict[str, Any] = {'version': 1, 'id': position_id, 'state': 'prepared',
-                                  'base': pair.base, 'legs': [{'venue': pair.long_venue, 'request': legs[0]},
+                                  'base': pair.base, 'okx_contract_size': pair.okx_contract_size,
+                                  'legs': [{'venue': pair.long_venue, 'request': legs[0]},
                                                                {'venue': pair.short_venue, 'request': legs[1]}]}
         _write_journal(path, record)
         token = _PAIR_ACTIVE.set(True)
@@ -338,6 +384,14 @@ def execute_pair(pair: FuturesPair, *, confirmed: bool = False) -> dict[str, Any
                 record['legs'][index]['confirmation'] = result
                 record['state'] = f'leg_{index + 1}_filled'
                 _write_journal(path, record)
+                try:
+                    _reconcile_step(pair, record['legs'], index + 1, risk_limits)
+                except Exception:
+                    record['state'] = 'reconciliation_required'
+                    _write_journal(path, record)
+                    return {'state': 'reconciliation_required', 'id': position_id, 'confirmed_legs': index + 1}
+                record['state'] = f'leg_{index + 1}_reconciled'
+                _write_journal(path, record)
             # Both order fills alone do not prove exchange positions match.
             record['state'] = 'position_reconciliation_required'
             _write_journal(path, record)
@@ -347,3 +401,102 @@ def execute_pair(pair: FuturesPair, *, confirmed: bool = False) -> dict[str, Any
     finally:
         unlock(fd)
         os.close(fd)
+
+
+def reconcile_pending(*, confirmed: bool = False, risk_limits=None) -> dict[str, Any]:
+    """Read-only post-restart check; never retries, clears a journal or closes.
+
+    A crash before an order confirmation remains manual-only because lookup by
+    client ID and complete history reconciliation are not yet implemented.
+    Even a matching snapshot does not authorize a subsequent order.
+    """
+    import stat
+    from execution import demo_futures_data
+    from execution.demo_futures_preflight import RiskLimits
+
+    _permit(confirmed)
+    if not isinstance(risk_limits, RiskLimits):
+        raise DemoBlocked('Explicit reconciliation limits required')
+    if execution_mode.current_mode() != 'demo':
+        raise DemoBlocked('Demo mode is required')
+    path = _journal_path()
+    if not path.parent.is_dir() or path.is_symlink():
+        raise DemoBlocked('Pending journal unavailable')
+    lock_fd = os.open(path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    locked = False
+    try:
+        locked = lock_exclusive(lock_fd, blocking=False)
+        if not locked:
+            raise DemoBlocked('Another demo operation is in progress')
+        if path.is_symlink():
+            raise DemoBlocked('Pending journal unavailable')
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        with os.fdopen(fd, 'rb') as file:
+            info = os.fstat(file.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_size > 1_048_576 or
+                    (os.name != 'nt' and (info.st_uid != os.geteuid() or info.st_mode & 0o077))):
+                raise DemoBlocked('Pending journal unavailable')
+            raw = file.read(1_048_577)
+        if len(raw) > 1_048_576:
+            raise DemoBlocked('Pending journal unavailable')
+        record = json.loads(raw)
+        states = {'prepared', 'leg_1_submitting', 'leg_1_acknowledged', 'leg_1_filled', 'leg_1_reconciled',
+                  'leg_2_submitting', 'leg_2_acknowledged', 'leg_2_filled', 'leg_2_reconciled',
+                  'reconciliation_required', 'position_reconciliation_required'}
+        if (not isinstance(record, dict) or type(record.get('version')) is not int or record['version'] != 1 or
+                record.get('state') not in states or not isinstance(record.get('id'), str) or
+                not re.fullmatch(r'[a-f0-9]{32}', record['id']) or not isinstance(record.get('legs'), list) or
+                len(record['legs']) != 2):
+            raise DemoBlocked('Pending journal invalid')
+        legs = record['legs']
+        if any(not isinstance(leg, dict) or leg.get('venue') not in _VENUES or not isinstance(leg.get('request'), dict) for leg in legs):
+            raise DemoBlocked('Pending journal invalid')
+        if {legs[0]['venue'], legs[1]['venue']} != _VENUES:
+            raise DemoBlocked('Pending journal invalid')
+        for index, leg in enumerate(legs):
+            fields = leg['request']
+            _validate_route(leg['venue'], 'POST', None, fields)
+            if 'reduceOnly' in fields or fields['side'].lower() != ('buy' if index == 0 else 'sell'):
+                raise DemoBlocked('Pending journal invalid')
+        bybit_leg = next(leg for leg in legs if leg['venue'] == 'bybit')
+        okx_leg = next(leg for leg in legs if leg['venue'] == 'okx')
+        if bybit_leg['request']['orderLinkId'] == okx_leg['request']['clOrdId']:
+            raise DemoBlocked('Pending journal invalid')
+        pair = FuturesPair(record['base'], legs[0]['venue'], legs[1]['venue'], bybit_leg['request']['qty'],
+                           okx_leg['request']['sz'], record['okx_contract_size'])
+        pair.validate()
+        if (bybit_leg['request']['symbol'] != pair.base + 'USDT' or
+                okx_leg['request']['instId'] != pair.base + '-USDT-SWAP'):
+            raise DemoBlocked('Pending journal invalid')
+        count = 0
+        for leg in legs:
+            confirmation = leg.get('confirmation')
+            if confirmation is None:
+                break
+            if (not isinstance(confirmation, dict) or confirmation.get('venue') != leg['venue'] or
+                    confirmation.get('order_id') != leg.get('order_id') or
+                    not isinstance(leg.get('order_id'), str) or
+                    not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', leg['order_id']) or
+                    _quantity(confirmation.get('filled_qty')) != _quantity(leg['request']['qty' if leg['venue'] == 'bybit' else 'sz']) or
+                    _quantity(confirmation.get('avg_price')) <= 0):
+                raise DemoBlocked('Pending journal invalid')
+            count += 1
+        if count < 2 and legs[1].get('confirmation') is not None:
+            raise DemoBlocked('Pending journal invalid')
+        if count == 0:
+            return {'state': 'manual_reconciliation_required', 'confirmed_legs': 0, 'confirmed_leg_evidence_checked': False}
+        try:
+            demo_futures_data.verify_step(pair, legs, count, max_age_ms=risk_limits.max_snapshot_age_ms)
+        except demo_futures_data.DemoDataBlocked:
+            return {'state': 'manual_reconciliation_required', 'confirmed_legs': count, 'confirmed_leg_evidence_checked': False}
+        # Even matching bounded reads cannot clear the journal or guarantee
+        # complete history, safe close, or a synchronized order opt-in.
+        return {'state': 'manual_reconciliation_required', 'confirmed_legs': count, 'confirmed_leg_evidence_checked': True}
+    except DemoBlocked:
+        raise
+    except Exception:
+        raise DemoBlocked('Pending journal unavailable or invalid') from None
+    finally:
+        if locked:
+            unlock(lock_fd)
+        os.close(lock_fd)
