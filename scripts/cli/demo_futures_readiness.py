@@ -11,8 +11,7 @@ for directory in (ROOT, ROOT / 'scripts'):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
 
-from core.execution_mode import current_mode
-from execution.demo_futures import DemoBlocked, FuturesPair, _preflight
+from core.execution_mode import current_state
 from execution.demo_futures_recovery import EvidenceBlocked, inspect_journal
 
 
@@ -26,18 +25,13 @@ def main(*, show_journal: bool = False) -> int:
             print('NOT READY: journal is busy, unavailable or invalid; manual review required')
             return 2
     try:
-        mode = current_mode()
+        state = current_state()
     except Exception:
         print('NOT READY: execution mode is unavailable; orders remain disabled')
         return 2
-    print(f'Execution mode: {mode}')
-    try:
-        _preflight(FuturesPair('BTC', 'bybit', 'okx', '0.01', '0.1', '0.1'))
-    except DemoBlocked:
-        print('NOT READY: trusted risk policy, recovery and safe close are incomplete')
-        return 2
-    # Do not equate preflight alone with permission to trade.
-    print('NOT READY: demo order execution requires a separate safety review')
+    print(f'Execution mode: {state["mode"]}; demo orders: {state["orders_enabled"]}; '
+          f'new openings: {state["openings_enabled"]}')
+    print('NOT READY: offline check cannot verify exchange credentials, balances or order permissions')
     return 2
 
 

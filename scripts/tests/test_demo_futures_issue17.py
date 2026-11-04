@@ -94,15 +94,16 @@ def test_disabled_by_default_and_preflight_gate(monkeypatch):
     with pytest.raises(demo.DemoBlocked, match='Demo mode'):
         demo.execute_pair(pair(), confirmed=True)
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     with pytest.raises(demo.DemoBlocked, match='preflight'):
         demo.execute_pair(pair(), confirmed=True)
     assert not exchange.requests and not demo._journal_path().exists()
     with pytest.raises(demo.DemoBlocked, match='permission'):
         demo.execute_pair(pair(), confirmed=False)
-    monkeypatch.delenv('FARB_ENABLE_DEMO_ORDERS')
+    execution_mode.set_demo_orders_enabled(False)
     with pytest.raises(demo.DemoBlocked, match='permission'):
         demo.execute_pair(pair(), confirmed=True)
-    monkeypatch.setenv('FARB_ENABLE_DEMO_ORDERS', '1')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     monkeypatch.setenv('FARB_LIVE', '1')
     with pytest.raises(demo.DemoBlocked, match='Live'):
         demo.execute_pair(pair(), confirmed=True)
@@ -113,8 +114,74 @@ def test_disabled_by_default_and_preflight_gate(monkeypatch):
     assert not exchange.requests
 
 
+def test_shared_demo_permission_and_stop_openings_are_fail_closed(monkeypatch):
+    execution_mode.set_mode('demo')
+    with pytest.raises(demo.DemoBlocked, match='permission'):
+        demo._permit(True, opening=True)
+    with pytest.raises(ValueError):
+        execution_mode.set_demo_orders_enabled(True)
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
+    demo._permit(True, opening=True)
+    execution_mode.set_demo_openings_enabled(False)
+    with pytest.raises(demo.DemoBlocked, match='openings'):
+        demo._permit(True, opening=True)
+    demo._permit(True)  # An explicitly requested close remains possible.
+    execution_mode.set_mode('simulation')
+    execution_mode.set_mode('demo')
+    assert execution_mode.current_state()['orders_enabled'] is False
+    with pytest.raises(demo.DemoBlocked, match='permission'):
+        demo._permit(True)
+
+
+def test_shared_permission_visible_to_another_process(monkeypatch, tmp_path):
+    import subprocess
+    monkeypatch.setattr(execution_mode, '_directory', lambda: tmp_path / '.funding-arb')
+    execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
+    execution_mode.set_demo_openings_enabled(False)
+    env = os.environ.copy()
+    env.update(HOME=str(tmp_path), USERPROFILE=str(tmp_path), PYTHONPATH=str(ROOT / 'scripts'))
+    result = subprocess.run([sys.executable, '-c',
+        'from core.execution_mode import current_state; s=current_state(); print(s["mode"], s["orders_enabled"], s["openings_enabled"])'],
+        env=env, text=True, capture_output=True, check=True, timeout=10)
+    assert result.stdout.strip() == 'demo True False'
+
+
+def test_server_restart_revokes_shared_demo_permission(monkeypatch):
+    import asyncio
+    from core import credentials
+    from server import main as server_main
+    execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
+    monkeypatch.setattr(credentials, 'ensure_env', lambda: None)
+    async def blocked_scanner():
+        await asyncio.Event().wait()
+    monkeypatch.setattr(server_main, '_background_scanner_loop', blocked_scanner)
+    async def check():
+        async with server_main.lifespan(server_main.app):
+            state = execution_mode.current_state()
+            assert state['mode'] == 'demo' and not state['orders_enabled'] and not state['openings_enabled']
+    asyncio.run(check())
+    with pytest.raises(demo.DemoBlocked, match='permission'):
+        demo._permit(True)
+
+
+@pytest.mark.parametrize('state', [
+    {'version': 1, 'mode': 'simulation', 'orders_enabled': True, 'openings_enabled': True},
+    {'version': 1, 'mode': 'demo', 'orders_enabled': False, 'openings_enabled': True},
+    {'version': 1, 'mode': 'demo', 'orders_enabled': True},
+])
+def test_inconsistent_shared_permission_blocks_orders(monkeypatch, state):
+    execution_mode.set_mode('demo')
+    path = execution_mode._directory() / 'execution-mode.json'
+    path.write_text(json.dumps(state))
+    with pytest.raises(demo.DemoBlocked, match='unavailable'):
+        demo._permit(True, opening=True)
+
+
 def test_no_testnet_live_or_unknown_venue_fallback(monkeypatch):
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     monkeypatch.setattr(demo, '_preflight', lambda _: None)
     monkeypatch.setenv('BYBIT_REQUIRE_TESTNET', '1')
     with pytest.raises(demo.DemoBlocked, match='separate'):
@@ -129,10 +196,11 @@ def test_no_testnet_live_or_unknown_venue_fallback(monkeypatch):
 
 def test_pair_end_to_end_with_two_futures_and_demo_endpoints(monkeypatch):
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     exchange = make_mock(monkeypatch)
     monkeypatch.setattr(demo, '_preflight', lambda _: None)
     result = demo.execute_pair(pair(), confirmed=True)
-    assert result['state'] == 'position_reconciliation_required' and result['confirmed_legs'] == 2
+    assert result['state'] == 'open_confirmed' and result['confirmed_legs'] == 2
     assert [r.method for r in exchange.requests] == ['POST', 'GET', 'POST', 'GET']
     assert [urlsplit(r.full_url).hostname for r in exchange.requests] == ['api-demo.bybit.com', 'api-demo.bybit.com', 'www.okx.com', 'www.okx.com']
     bybit, okx = exchange.orders['bybit'], exchange.orders['okx']
@@ -151,7 +219,7 @@ def test_pair_end_to_end_with_two_futures_and_demo_endpoints(monkeypatch):
             payload = headers['x-bapi-timestamp'] + 'bybit-demo-key' + '5000' + (url.query if request.method == 'GET' else request.data.decode())
             assert headers['x-bapi-sign'] == hmac.new(b'bybit-demo-secret', payload.encode(), hashlib.sha256).hexdigest()
     journal = json.loads(demo._journal_path().read_text())
-    assert journal['state'] == 'position_reconciliation_required'
+    assert journal['state'] == 'open_confirmed'
     assert 'demo-key' not in repr(journal) and 'demo-secret' not in repr(journal)
     with pytest.raises(demo.DemoBlocked, match='reconciliation'):
         demo.execute_pair(pair(), confirmed=True)
@@ -166,6 +234,7 @@ def test_pair_end_to_end_with_two_futures_and_demo_endpoints(monkeypatch):
 ])
 def test_unconfirmed_first_leg_never_opens_second(monkeypatch, bad):
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     exchange = make_mock(monkeypatch)
     exchange.bad_status = bad
     monkeypatch.setattr(demo, '_preflight', lambda _: None)
@@ -177,6 +246,7 @@ def test_unconfirmed_first_leg_never_opens_second(monkeypatch, bad):
 
 def test_unknown_submission_stops_without_retry_or_rollback(monkeypatch, capsys):
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     exchange = make_mock(monkeypatch)
     exchange.fail_on = ('bybit', 'POST')
     monkeypatch.setattr(demo, '_preflight', lambda _: None)
@@ -187,6 +257,7 @@ def test_unknown_submission_stops_without_retry_or_rollback(monkeypatch, capsys)
 
 def test_unknown_second_leg_never_triggers_rollback(monkeypatch):
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     exchange = make_mock(monkeypatch)
     exchange.fail_on = ('okx', 'POST')
     monkeypatch.setattr(demo, '_preflight', lambda _: None)
@@ -197,6 +268,7 @@ def test_unknown_second_leg_never_triggers_rollback(monkeypatch):
 
 def test_partial_second_leg_never_triggers_rollback(monkeypatch):
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     exchange = make_mock(monkeypatch)
     exchange.bad_venue = 'okx'
     exchange.bad_status = {'state': 'partially_filled', 'accFillSz': '0.05'}
@@ -208,6 +280,7 @@ def test_partial_second_leg_never_triggers_rollback(monkeypatch):
 
 def test_crash_after_durable_presend_intent_blocks_restart(monkeypatch):
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     monkeypatch.setattr(demo, '_preflight', lambda _: None)
     def crash(*args): raise KeyboardInterrupt()
     monkeypatch.setattr(demo, '_create_and_confirm', crash)
@@ -220,6 +293,7 @@ def test_crash_after_durable_presend_intent_blocks_restart(monkeypatch):
 
 def test_rejects_invalid_qty_and_known_live_keys_before_network(monkeypatch):
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     monkeypatch.setattr(demo, '_preflight', lambda _: None)
     with pytest.raises(demo.DemoBlocked, match='quantities'):
         demo.FuturesPair('BTC', 'bybit', 'okx', '1', '0.1', '0.1').validate()
@@ -236,6 +310,7 @@ def test_redirects_rejected_and_bad_mode_stops_request(monkeypatch):
     exchange = make_mock(monkeypatch)
     monkeypatch.setattr(demo, '_preflight', lambda _: None)
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     original = demo._write_journal
     def switch_after_first(path, data):
         original(path, data)
@@ -248,6 +323,7 @@ def test_redirects_rejected_and_bad_mode_stops_request(monkeypatch):
 
 def test_okx_first_and_incomplete_okx_fill_blocks_bybit(monkeypatch):
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     exchange = make_mock(monkeypatch)
     exchange.bad_status = {'state': 'partially_filled', 'accFillSz': '0.05'}
     monkeypatch.setattr(demo, '_preflight', lambda _: None)
@@ -258,6 +334,7 @@ def test_okx_first_and_incomplete_okx_fill_blocks_bybit(monkeypatch):
 
 def test_orders_disabled_on_corrupt_mode_and_invalid_inputs(monkeypatch):
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     exchange = make_mock(monkeypatch)
     monkeypatch.setattr(demo, '_preflight', lambda _: None)
     (execution_mode._directory() / 'execution-mode.json').write_text('{invalid')
@@ -270,6 +347,7 @@ def test_orders_disabled_on_corrupt_mode_and_invalid_inputs(monkeypatch):
 
 def test_every_private_request_stays_demo_with_explicit_confirmation(monkeypatch):
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     exchange = make_mock(monkeypatch)
     fields = demo._order_fields('okx', 'BTC', 'buy', '1', 'dummyclientid')
     with pytest.raises(demo.DemoBlocked):
@@ -285,6 +363,7 @@ def test_concurrent_pair_lock_blocks_another_process(monkeypatch):
     import time
     from execution.demo_futures_recovery import EvidenceBlocked, inspect_journal
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     exchange = make_mock(monkeypatch)
     monkeypatch.setattr(demo, '_preflight', lambda _: None)
     journal = demo._journal_path()
@@ -328,6 +407,7 @@ def test_offline_readiness_never_claims_ready_or_sends(monkeypatch, capsys):
     from cli import demo_futures_readiness
     exchange = make_mock(monkeypatch)
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     assert demo_futures_readiness.main() == 2
     assert 'NOT READY' in capsys.readouterr().out
     assert not exchange.requests
@@ -339,6 +419,7 @@ def test_offline_readiness_never_claims_ready_or_sends(monkeypatch, capsys):
 
 def test_transport_refuses_spot_non_futures_and_arbitrary_fields(monkeypatch):
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     exchange = make_mock(monkeypatch)
     bybit = demo._order_fields('bybit', 'BTC', 'buy', '0.01', 'fixtureid')
     bybit['category'] = 'spot'
@@ -357,6 +438,7 @@ def test_transport_refuses_spot_non_futures_and_arbitrary_fields(monkeypatch):
 
 def test_private_transport_cannot_bypass_pair_preflight_or_journal(monkeypatch):
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     exchange = make_mock(monkeypatch)
     fields = demo._order_fields('bybit', 'BTC', 'buy', '0.01', 'fixtureid')
     with pytest.raises(demo.DemoBlocked, match='journalled demo pair'):
@@ -367,6 +449,7 @@ def test_private_transport_cannot_bypass_pair_preflight_or_journal(monkeypatch):
 def test_acknowledged_order_id_is_durable_before_status_timeout(monkeypatch):
     from execution.demo_futures_recovery import inspect_journal
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     exchange = make_mock(monkeypatch)
     exchange.fail_on = ('bybit', 'GET')
     monkeypatch.setattr(demo, '_preflight', lambda _: None)
@@ -386,6 +469,7 @@ def test_journal_diagnostic_fails_closed_on_corruption(monkeypatch, capsys):
     from execution.demo_futures_recovery import EvidenceBlocked, inspect_journal
     assert inspect_journal().state == 'no_journal'
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     path = demo._journal_path()
     path.write_text('{invalid')
     path.chmod(0o600)
@@ -402,6 +486,7 @@ def test_journal_diagnostic_fails_closed_on_corruption(monkeypatch, capsys):
 
 def test_reconciliation_failure_after_first_fill_blocks_second_leg(monkeypatch):
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     exchange = make_mock(monkeypatch)
     monkeypatch.setattr(demo, '_preflight', lambda _: None)
     def fail(*args):
@@ -416,6 +501,7 @@ def test_reconciliation_failure_after_first_fill_blocks_second_leg(monkeypatch):
 
 def test_reconciliation_hook_runs_between_futures_legs(monkeypatch):
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     exchange = make_mock(monkeypatch)
     monkeypatch.setattr(demo, '_preflight', lambda _: None)
     calls = []
@@ -423,7 +509,7 @@ def test_reconciliation_hook_runs_between_futures_legs(monkeypatch):
         calls.append((confirmed, len(exchange.requests)))
     monkeypatch.setattr(demo, '_reconcile_step', check)
     result = demo.execute_pair(pair(), confirmed=True)
-    assert result['state'] == 'position_reconciliation_required'
+    assert result['state'] == 'open_confirmed'
     assert calls == [(1, 2), (2, 4)]
 
 
@@ -442,12 +528,13 @@ def test_reduce_only_futures_fields_cannot_be_silently_disabled(monkeypatch, ven
 
 
 def test_filled_legs_run_readonly_position_reconciliation_in_order(monkeypatch):
-    # Existing preflight stays blocked in production. Here only, it is replaced
-    # to exercise the order and reconciliation sequence with fake data.
+    # This older unit test isolates order sequencing; separate lifecycle tests
+    # exercise the actual preflight with mocked exchange responses.
     import time
     from execution import demo_futures_data
     from execution.demo_futures_preflight import RiskLimits
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     exchange = make_mock(monkeypatch)
     monkeypatch.setattr(demo, '_preflight', lambda *args, **kwargs: None)
     # The module fixture stubs reconciliation for old transport tests; restore
@@ -488,15 +575,17 @@ def test_filled_legs_run_readonly_position_reconciliation_in_order(monkeypatch):
     monkeypatch.setattr(demo_futures_data, 'read', read)
     risk = RiskLimits(10_000, 60_000, 30_000, 600_000, 5_000, '10000', '3', '1', '0.001', '0.001', '0.1', '0')
     result = demo.execute_pair(pair(), confirmed=True, risk_limits=risk)
-    assert result['state'] == 'position_reconciliation_required' and result['confirmed_legs'] == 2
+    assert result['state'] == 'open_confirmed' and result['confirmed_legs'] == 2
     assert [req.method for req in exchange.requests] == ['POST', 'GET', 'POST', 'GET']
-    assert any(item == ('bybit', 'fills', 2) for item in reads)
-    assert any(item == ('okx', 'fills', 4) for item in reads)
+    assert any(item == ('bybit', 'position', 2) for item in reads)
+    assert any(item == ('okx', 'position', 4) for item in reads)
+    assert all(item[1] != 'fills' for item in reads)
 
 
 def test_duplicate_generated_client_order_ids_block_before_journal_or_network(monkeypatch):
     from types import SimpleNamespace
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     exchange = make_mock(monkeypatch)
     monkeypatch.setattr(demo, '_preflight', lambda _: None)
     monkeypatch.setattr(demo.uuid, 'uuid4', lambda: SimpleNamespace(hex='a' * 32))

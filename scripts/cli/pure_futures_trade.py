@@ -59,7 +59,109 @@ def main() -> int:
     ls.add_argument("--all", action="store_true", help="include closed positions")
     ls.add_argument("--json", action="store_true")
 
+    sub.add_parser("demo-mode", help="select demo mode and disable demo orders")
+    enable = sub.add_parser("demo-enable", help="enable demo orders explicitly")
+    enable.add_argument("--confirm", action="store_true", help="confirm demo order permission")
+    sub.add_parser("demo-stop", help="stop new demo openings while keeping closes available")
+    sub.add_parser("demo-disable", help="disable all demo orders")
+    sub.add_parser("demo-state", help="show the shared execution mode and demo permissions")
+    dop = sub.add_parser("demo-open", help="open a Bybit/OKX demo futures pair")
+    dop.add_argument('base')
+    dop.add_argument('--long-venue', required=True, choices=('bybit', 'okx'))
+    dop.add_argument('--short-venue', required=True, choices=('bybit', 'okx'))
+    dop.add_argument('--trade-usd', required=True)
+    dop.add_argument('--confirm', action='store_true')
+    dcl = sub.add_parser('demo-close', help='close the journalled demo pair reduce-only')
+    dcl.add_argument('--confirm', action='store_true')
+    dps = sub.add_parser('demo-positions', help='show demo positions and pending orders')
+    dps.add_argument('base')
+    dc = sub.add_parser('demo-cancel', help='cancel one uncertain journalled order')
+    dc.add_argument('--venue', required=True, choices=('bybit', 'okx'))
+    dc.add_argument('--client-id', required=True)
+    dc.add_argument('--confirm', action='store_true')
+    ds = sub.add_parser('demo-order', help='look up a demo order by client ID')
+    ds.add_argument('base')
+    ds.add_argument('--venue', required=True, choices=('bybit', 'okx'))
+    ds.add_argument('--client-id', required=True)
+    dr = sub.add_parser('demo-resolve', help='resolve a journal after terminal statuses and flat accounts')
+    dr.add_argument('--confirm', action='store_true')
+
     args = p.parse_args()
+    if args.cmd.startswith('demo-'):
+        from core import execution_mode
+        if args.cmd in ('demo-open', 'demo-close', 'demo-positions', 'demo-cancel', 'demo-order', 'demo-resolve'):
+            from execution import demo_futures, demo_futures_data
+            from execution.demo_futures_preflight import TechnicalLimits
+            limits = TechnicalLimits(30_000)
+            try:
+                if args.cmd == 'demo-open':
+                    if not args.confirm:
+                        p.error('demo-open requires --confirm')
+                    pair = demo_futures_data.pair_for_notional(args.base.upper(), args.long_venue,
+                                                               args.short_venue, args.trade_usd,
+                                                               max_age_ms=limits.max_snapshot_age_ms)
+                    result = demo_futures.execute_pair(pair, confirmed=True, risk_limits=limits)
+                elif args.cmd == 'demo-close':
+                    if not args.confirm:
+                        p.error('demo-close requires --confirm')
+                    result = demo_futures.close_pair(confirmed=True, close_confirmed=True, risk_limits=limits)
+                elif args.cmd == 'demo-cancel':
+                    if not args.confirm:
+                        p.error('demo-cancel requires --confirm')
+                    result = demo_futures.cancel_pending(args.venue, args.client_id, confirmed=True)
+                elif args.cmd == 'demo-resolve':
+                    if not args.confirm:
+                        p.error('demo-resolve requires --confirm')
+                    result = demo_futures.resolve_pending_flat(confirmed=True, max_age_ms=limits.max_snapshot_age_ms)
+                elif args.cmd == 'demo-order':
+                    result = []
+                    resources = ('lookup_current', 'lookup_history') if args.venue == 'bybit' else ('lookup_order',)
+                    for resource in resources:
+                        response = demo_futures_data.read(args.venue, args.base.upper(), resource,
+                                                          client_id=args.client_id).payload
+                        if args.venue == 'bybit':
+                            rows = response['result']['list']
+                            keys = ('symbol', 'orderId', 'orderLinkId', 'side', 'orderStatus', 'qty', 'cumExecQty')
+                            cursor = response['result']['nextPageCursor']
+                        else:
+                            rows = response['data']
+                            keys = ('instId', 'ordId', 'clOrdId', 'side', 'state', 'sz', 'accFillSz')
+                            cursor = ''
+                        result.append({'source': resource, 'orders': [{key: row.get(key) for key in keys} for row in rows],
+                                       'more_history': bool(cursor)})
+                else:
+                    result = {}
+                    for venue in ('bybit', 'okx'):
+                        position = demo_futures_data.read(venue, args.base.upper(), 'position').payload
+                        orders = demo_futures_data.read(venue, args.base.upper(), 'orders').payload
+                        if venue == 'bybit':
+                            positions, pending = position['result']['list'], orders['result']['list']
+                            position_keys = ('symbol', 'side', 'size', 'positionIdx')
+                            order_keys = ('symbol', 'orderId', 'orderLinkId', 'side', 'orderStatus', 'qty', 'cumExecQty')
+                        else:
+                            positions, pending = position['data'], orders['data']
+                            position_keys = ('instId', 'posSide', 'pos', 'mgnMode')
+                            order_keys = ('instId', 'ordId', 'clOrdId', 'side', 'state', 'sz', 'accFillSz')
+                        result[venue] = {'positions': [{key: row.get(key) for key in position_keys} for row in positions],
+                                         'orders': [{key: row.get(key) for key in order_keys} for row in pending]}
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                return 2 if isinstance(result, dict) and result.get('state') in (
+                    'reconciliation_required', 'close_reconciliation_required', 'cancel_reconciliation_required') else 0
+            except Exception:
+                print('Demo operation blocked; review the journal and account state.', file=sys.stderr)
+                return 2
+        if args.cmd == 'demo-mode':
+            execution_mode.set_mode('demo')
+        elif args.cmd == 'demo-enable':
+            if not args.confirm:
+                p.error('demo-enable requires --confirm')
+            execution_mode.set_demo_orders_enabled(True, confirmed=True)
+        elif args.cmd == 'demo-stop':
+            execution_mode.set_demo_openings_enabled(False)
+        elif args.cmd == 'demo-disable':
+            execution_mode.set_demo_orders_enabled(False)
+        print(json.dumps(execution_mode.current_state(), ensure_ascii=False))
+        return 0
     if args.cmd == "open":
         if args.live and args.dry_run:
             p.error("--live and --dry-run are mutually exclusive")

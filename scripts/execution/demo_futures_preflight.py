@@ -1,9 +1,7 @@
 """Offline, fail-closed validation of normalized demo futures snapshots.
 
-This evaluator does not obtain exchange data and is intentionally not an order
+This optional evaluator does not obtain exchange data and is not an order
 permission. A caller-provided ``environment`` label cannot prove provenance.
-The demo executor remains blocked until trusted demo-only collectors, exchange
-reconciliation and safe closing are implemented and integrated.
 """
 from __future__ import annotations
 
@@ -16,6 +14,11 @@ from fractions import Fraction
 
 class PreflightBlocked(ValueError):
     """Required evidence is missing, stale, inconsistent or outside a limit."""
+
+
+@dataclass(frozen=True)
+class TechnicalLimits:
+    max_snapshot_age_ms: int
 
 
 @dataclass(frozen=True)

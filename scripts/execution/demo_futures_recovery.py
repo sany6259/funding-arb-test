@@ -271,10 +271,11 @@ def inspect_journal() -> JournalSummary:
         data = json.loads(raw)
         states = {'prepared', 'leg_1_submitting', 'leg_1_acknowledged', 'leg_1_filled', 'leg_1_reconciled',
                   'leg_2_submitting', 'leg_2_acknowledged', 'leg_2_filled', 'leg_2_reconciled',
-                  'reconciliation_required', 'position_reconciliation_required', 'close_prepared',
+                  'reconciliation_required', 'position_reconciliation_required', 'open_confirmed', 'close_prepared',
                   'close_1_submitting', 'close_1_acknowledged', 'close_1_filled', 'close_1_reconciled',
                   'close_2_submitting', 'close_2_acknowledged', 'close_2_filled', 'close_2_reconciled',
-                  'close_reconciliation_required', 'closed_observed_manual_review'}
+                  'close_reconciliation_required', 'closed_observed_manual_review', 'closed_confirmed',
+                  'cancel_submitting', 'cancel_reconciliation_required', 'manually_resolved_flat'}
         if (not isinstance(data, dict) or type(data.get('version')) is not int or data.get('version') != 1 or data.get('state') not in states or
                 not isinstance(data.get('id'), str) or not re.fullmatch(r'[a-f0-9]{32}', data['id']) or
                 not isinstance(data.get('legs'), list) or len(data['legs']) != 2):

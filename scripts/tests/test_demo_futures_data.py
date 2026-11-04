@@ -75,11 +75,12 @@ def pair(): return demo.FuturesPair('BTC', 'bybit', 'okx', '0.018', '1.8', '0.01
 def exchange(monkeypatch, tmp_path):
     monkeypatch.setattr(execution_mode, '_directory', lambda: tmp_path / 'state')
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     monkeypatch.setattr(demo_credentials, '_backend', lambda: 'age')
     monkeypatch.setattr(demo_credentials, 'load', lambda venue, environment: {
         'key': venue + '-dummy-key', 'secret': venue + '-dummy-secret', 'passphrase': 'dummy-pass'})
     monkeypatch.setenv('FARB_ENABLE_DEMO_ORDERS', '1')
-    for name in ('FARB_DRY_RUN', 'FARB_LIVE', 'DCA_LIVE', 'BYBIT_REQUIRE_TESTNET', 'BYBIT_API_KEY', 'OKX_API_KEY'):
+    for name in ('FARB_DRY_RUN', 'FARB_LIVE', 'DCA_LIVE', 'BYBIT_REQUIRE_TESTNET', 'BYBIT_API_KEY', 'BYBIT_TESTNET_API_KEY', 'OKX_API_KEY'):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(data, 'time', SimpleNamespace(time=lambda: NOW / 1000))
     monkeypatch.setattr(demo, 'time', SimpleNamespace(time=lambda: NOW / 1000))
@@ -106,11 +107,54 @@ def exchange(monkeypatch, tmp_path):
     return responses, calls
 
 
-def test_preflight_collects_both_demo_venues_but_preserves_order_block(exchange):
+def test_technical_open_needs_no_funding_or_fee_history(exchange):
+    responses, calls = exchange
+    del responses[('okx', '/api/v5/public/funding-rate')]
+    del responses[('okx', '/api/v5/account/trade-fee')]
+    del responses[('bybit', '/v5/account/fee-rate')]
+    data.verify_technical_open(pair(), max_age_ms=10_000)
+    assert calls and all(req.method == 'GET' for req in calls)
+    assert not any(urlsplit(req.full_url).path in ('/v5/execution/list', '/api/v5/trade/fills') for req in calls)
+
+
+def test_demo_pair_sizing_uses_common_contract_step_and_never_exceeds_notional(exchange):
     _, calls = exchange
-    with pytest.raises(demo.DemoBlocked, match='reconciliation and safe close'):
-        demo.execute_pair(pair(), confirmed=True, risk_limits=limits())
-    assert len(calls) == 25 and all(req.method == 'GET' for req in calls)
+    sized = data.pair_for_notional('BTC', 'bybit', 'okx', '2000', max_age_ms=10_000)
+    assert sized == pair()
+    assert all(req.method == 'GET' for req in calls)
+
+
+def test_demo_pair_sizing_rejects_unknown_venue_or_too_small_notional(exchange):
+    _, calls = exchange
+    with pytest.raises(data.DemoDataBlocked):
+        data.pair_for_notional('BTC', 'bybit', 'bitget', '2000', max_age_ms=10_000)
+    assert not calls
+    with pytest.raises(data.DemoDataBlocked):
+        data.pair_for_notional('BTC', 'bybit', 'okx', '1', max_age_ms=10_000)
+    assert all(req.method == 'GET' for req in calls)
+
+
+@pytest.mark.parametrize('mutate', [
+    lambda f: f[('okx', '/api/v5/account/balance')]['data'][0]['details'][0].update(availEq='1'),
+    lambda f: f[('bybit', '/v5/account/wallet-balance')]['result']['list'][0].update(totalAvailableBalance='0'),
+    lambda f: f[('bybit', '/v5/position/list')]['result']['list'][0].update(size='0.001'),
+    lambda f: f[('okx', '/api/v5/trade/orders-pending')]['data'].append({'ordId': 'unknown'}),
+    lambda f: f[('okx', '/api/v5/public/instruments')]['data'][0].update(ctVal='0.1'),
+    lambda f: f[('bybit', '/v5/market/instruments-info')]['result']['list'][0]['lotSizeFilter'].update(qtyStep='0.007'),
+    lambda f: f[('okx', '/api/v5/public/mark-price')]['data'][0].update(ts=str(NOW-11_000)),
+])
+def test_technical_open_blocks_unsafe_accounts_and_instruments(exchange, mutate):
+    responses, calls = exchange
+    mutate(responses)
+    with pytest.raises(data.DemoDataBlocked):
+        data.verify_technical_open(pair(), max_age_ms=10_000)
+    assert all(req.method == 'GET' for req in calls)
+
+
+def test_preflight_collects_both_demo_venues(exchange):
+    _, calls = exchange
+    demo._preflight(pair(), risk_limits=limits())
+    assert len(calls) == 20 and all(req.method == 'GET' for req in calls)
     assert not demo._journal_path().exists()
     for req in calls:
         url = urlsplit(req.full_url)
@@ -134,10 +178,7 @@ def test_preflight_collects_both_demo_venues_but_preserves_order_block(exchange)
     lambda f: f[('bybit', '/v5/position/list')]['result']['list'][0].update(size='0.01'),
     lambda f: f[('okx', '/api/v5/account/balance')]['data'][0]['details'][0].update(availEq='1'),
     lambda f: f[('okx', '/api/v5/public/instruments')]['data'][0].pop('ctVal'),
-    lambda f: f[('bybit', '/v5/market/orderbook')]['result'].update(a=[['100001', '0.001']]),
     lambda f: f[('okx', '/api/v5/public/mark-price')]['data'][0].update(ts=str(NOW-11_000)),
-    lambda f: f[('okx', '/api/v5/public/funding-rate')]['data'][0].pop('ts'),
-    lambda f: f[('bybit', '/v5/account/fee-rate')].update(retCode=10003),
     lambda f: f[('okx', '/api/v5/trade/orders-pending')]['data'].append({'ordId': '1'}),
     lambda f: f[('bybit', '/v5/order/realtime#conditional')]['result']['list'].append({'orderId': '1'}),
     lambda f: f[('okx', '/api/v5/trade/orders-algo-pending')]['data'].append({'algoId': '1'}),
@@ -189,7 +230,7 @@ def add_reconciliation_fixtures(responses, both=False):
 def test_reconciliation_reads_executions_and_both_positions_before_next_leg(exchange):
     responses, calls = exchange
     add_reconciliation_fixtures(responses)
-    demo._reconcile_step(pair(), confirmed_legs(), 1, limits())
+    data.verify_step(pair(), confirmed_legs(), 1, max_age_ms=10_000)
     assert len(calls) == 12 and all(req.method == 'GET' for req in calls)
     assert any(urlsplit(req.full_url).path == '/v5/execution/list' for req in calls)
     assert any(urlsplit(req.full_url).path == '/api/v5/account/positions' for req in calls)
@@ -198,7 +239,7 @@ def test_reconciliation_reads_executions_and_both_positions_before_next_leg(exch
 def test_reconciliation_checks_both_futures_legs(exchange):
     responses, calls = exchange
     add_reconciliation_fixtures(responses, both=True)
-    demo._reconcile_step(pair(), confirmed_legs(), 2, limits())
+    data.verify_step(pair(), confirmed_legs(), 2, max_age_ms=10_000)
     assert len(calls) == 13 and all(req.method == 'GET' for req in calls)
     assert any(urlsplit(req.full_url).path == '/api/v5/trade/fills' for req in calls)
 
@@ -216,8 +257,8 @@ def test_reconciliation_rejects_ambiguous_fill_or_position(exchange, mutate):
     responses, calls = exchange
     add_reconciliation_fixtures(responses)
     mutate(responses)
-    with pytest.raises(demo.ReconciliationRequired):
-        demo._reconcile_step(pair(), confirmed_legs(), 1, limits())
+    with pytest.raises(data.DemoDataBlocked):
+        data.verify_step(pair(), confirmed_legs(), 1, max_age_ms=10_000)
     assert all(req.method == 'GET' for req in calls)
 
 
@@ -278,6 +319,29 @@ def test_restart_reconciliation_reads_confirmed_leg_without_clearing_journal(exc
         demo.execute_pair(pair(), confirmed=True, risk_limits=limits())
 
 
+def test_normal_reconciliation_uses_full_order_confirmation_without_execution_history(exchange):
+    responses, calls = exchange
+    add_reconciliation_fixtures(responses)
+    del responses[('bybit', '/v5/execution/list')]
+    demo._reconcile_step(pair(), journal_record(1)['legs'], 1, limits())
+    assert all(req.method == 'GET' for req in calls)
+    assert not any(urlsplit(req.full_url).path == '/v5/execution/list' for req in calls)
+
+
+@pytest.mark.parametrize('change', [
+    lambda row: row.update(filled_qty='0.009'),
+    lambda row: row.update(avg_price='0'),
+    lambda row: row.update(order_id=''),
+])
+def test_normal_reconciliation_blocks_unconfirmed_order(exchange, change):
+    responses, _ = exchange
+    add_reconciliation_fixtures(responses)
+    legs = journal_record(1)['legs']
+    change(legs[0]['confirmation'])
+    with pytest.raises(demo.ReconciliationRequired):
+        demo._reconcile_step(pair(), legs, 1, limits())
+
+
 def test_restart_before_order_confirmation_never_retries_or_clears(exchange):
     _, calls = exchange
     path = demo._journal_path()
@@ -319,6 +383,7 @@ def test_process_restart_with_unconfirmed_order_does_not_send_or_retry(exchange,
     import subprocess
     monkeypatch.setattr(execution_mode, '_directory', lambda: tmp_path / '.funding-arb')
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     path = demo._journal_path()
     record = journal_record(0)
     record['state'] = 'leg_1_submitting'
@@ -359,7 +424,7 @@ def test_paginated_bybit_executions_are_combined_before_confirmation(exchange, m
             return data.ReadResult(payload, NOW)
         return original(venue, base, resource)
     monkeypatch.setattr(data, 'read', paged)
-    demo._reconcile_step(pair(), confirmed_legs(), 1, limits())
+    data.verify_step(pair(), confirmed_legs(), 1, max_age_ms=10_000)
     assert seen == [None, 'next-page'] and all(req.method == 'GET' for req in calls)
 
 
@@ -374,15 +439,15 @@ def test_duplicate_execution_across_pages_and_repeated_cursor_block(exchange, mo
             return data.ReadResult(bybit({'list': [record], 'nextPageCursor': 'next-page' if cursor is None else ''}), NOW)
         return original(venue, base, resource)
     monkeypatch.setattr(data, 'read', duplicate)
-    with pytest.raises(demo.ReconciliationRequired):
-        demo._reconcile_step(pair(), confirmed_legs(), 1, limits())
+    with pytest.raises(data.DemoDataBlocked):
+        data.verify_step(pair(), confirmed_legs(), 1, max_age_ms=10_000)
     def repeated(venue, base, resource, *, cursor=None):
         if venue == 'bybit' and resource == 'fills':
             return data.ReadResult(bybit({'list': [record], 'nextPageCursor': 'same-cursor'}), NOW)
         return original(venue, base, resource)
     monkeypatch.setattr(data, 'read', repeated)
-    with pytest.raises(demo.ReconciliationRequired):
-        demo._reconcile_step(pair(), confirmed_legs(), 1, limits())
+    with pytest.raises(data.DemoDataBlocked):
+        data.verify_step(pair(), confirmed_legs(), 1, max_age_ms=10_000)
 
 
 def test_okx_pagination_uses_last_bill_id(exchange, monkeypatch):
@@ -584,7 +649,7 @@ def test_close_partial_unknown_or_residual_positions_remain_blocked(exchange, mu
     assert all(req.method == 'GET' for req in calls)
 
 
-def test_close_pair_cannot_bypass_preflight_with_open_positions(exchange):
+def test_close_preflight_accepts_verified_open_positions(exchange):
     responses, calls = exchange
     add_reconciliation_fixtures(responses, both=True)
     record = journal_record(2)
@@ -592,8 +657,7 @@ def test_close_pair_cannot_bypass_preflight_with_open_positions(exchange):
     path = demo._journal_path()
     demo._write_journal(path, record)
     before = path.read_bytes()
-    with pytest.raises(demo.DemoBlocked, match='lifecycle integration is incomplete'):
-        demo.close_pair(confirmed=True, close_confirmed=True, risk_limits=limits())
+    demo._preflight_close(pair(), record['legs'], close_legs(), risk_limits=limits())
     assert path.read_bytes() == before and all(req.method == 'GET' for req in calls)
     paths = {urlsplit(req.full_url).path for req in calls}
     assert '/v5/market/instruments-info' in paths and '/api/v5/public/instruments' in paths
@@ -615,8 +679,12 @@ def test_close_preflight_supports_reversed_futures_directions(exchange):
     path = demo._journal_path()
     demo._write_journal(path, record)
     before = path.read_bytes()
-    with pytest.raises(demo.DemoBlocked, match='lifecycle integration is incomplete'):
-        demo.close_pair(confirmed=True, close_confirmed=True, risk_limits=limits())
+    reversed_pair = demo.FuturesPair('BTC', 'okx', 'bybit', '0.018', '1.8', '0.01')
+    closing = [
+        {'venue': 'bybit', 'request': demo._order_fields('bybit', 'BTC', 'buy', '0.018', 'newbybit', reduce_only=True)},
+        {'venue': 'okx', 'request': demo._order_fields('okx', 'BTC', 'sell', '1.8', 'newokx', reduce_only=True)},
+    ]
+    demo._preflight_close(reversed_pair, record['legs'], closing, risk_limits=limits())
     assert path.read_bytes() == before and all(req.method == 'GET' for req in calls)
 
 
@@ -640,8 +708,7 @@ def test_close_preflight_rechecks_position_freshness_after_market_reads(exchange
     lambda f: f[('okx', '/api/v5/public/instruments')]['data'][0].update(ctVal='0.1'),
     lambda f: f[('bybit', '/v5/market/instruments-info')]['result']['list'][0]['lotSizeFilter'].update(qtyStep='0.007'),
     lambda f: f[('okx', '/api/v5/public/instruments')]['data'][0].update(maxMktSz='1'),
-    lambda f: f[('bybit', '/v5/market/orderbook')]['result'].update(ts=NOW - 11_000),
-    lambda f: f[('okx', '/api/v5/market/books')]['data'][0].update(asks=[['101000', '10']]),
+    lambda f: f[('okx', '/api/v5/public/mark-price')]['data'][0].update(ts=str(NOW - 11_000)),
     lambda f: f[('okx', '/api/v5/account/positions')]['data'][0].update(pos='1.8'),
 ])
 def test_close_pair_rejects_unsafe_positions_and_instrument_data(exchange, mutate):
@@ -656,6 +723,17 @@ def test_close_pair_rejects_unsafe_positions_and_instrument_data(exchange, mutat
     with pytest.raises(demo.DemoBlocked, match='could not verify'):
         demo.close_pair(confirmed=True, close_confirmed=True, risk_limits=limits())
     assert path.read_bytes() == before and all(req.method == 'GET' for req in calls)
+
+
+def test_close_preflight_does_not_require_book_or_fill_history(exchange):
+    responses, calls = exchange
+    add_reconciliation_fixtures(responses, both=True)
+    del responses[('bybit', '/v5/execution/list')]
+    del responses[('okx', '/api/v5/trade/fills')]
+    del responses[('bybit', '/v5/market/orderbook')]
+    del responses[('okx', '/api/v5/market/books')]
+    demo._preflight_close(pair(), journal_record(2)['legs'], close_legs(), risk_limits=limits())
+    assert all(req.method == 'GET' for req in calls)
 
 
 @pytest.mark.parametrize('mutate', [
@@ -844,6 +922,7 @@ def test_close_restart_in_new_process_does_not_send_or_change_journal(exchange, 
     import subprocess
     monkeypatch.setattr(execution_mode, '_directory', lambda: tmp_path / '.funding-arb')
     execution_mode.set_mode('demo')
+    execution_mode.set_demo_orders_enabled(True, confirmed=True)
     record = journal_record(2)
     record['state'] = 'close_1_submitting'
     record['closing'] = unsubmitted_close_legs()
@@ -878,3 +957,320 @@ def test_close_reconciliation_rejects_mismatched_recorded_order_id(exchange):
     with pytest.raises(data.DemoDataBlocked):
         data.verify_close_step(pair(), journal_record(2)['legs'], closing, 1, max_age_ms=10_000)
     assert all(req.method == 'GET' for req in calls)
+
+
+class LifecycleExchange:
+    """In-memory exchange: the only object allowed to receive test requests."""
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = []
+        self.orders = {}
+        self.fail_post = None
+        self.reject_post = None
+        self.partial = None
+        self.cancel_timeout = False
+        self.terminal = {}
+
+    def open(self, request, timeout):
+        from urllib.parse import urlsplit, parse_qs
+        url = urlsplit(request.full_url)
+        venue = {'api-demo.bybit.com': 'bybit', 'www.okx.com': 'okx'}.get(url.hostname)
+        assert venue in ('bybit', 'okx') and url.scheme == 'https'
+        if venue == 'okx':
+            assert {k.lower(): v for k, v in request.header_items()}['x-simulated-trading'] == '1'
+        self.calls.append(request)
+        query = parse_qs(url.query)
+        if request.method == 'POST':
+            assert url.path in ('/v5/order/create', '/api/v5/trade/order', '/v5/order/cancel', '/api/v5/trade/cancel-order')
+            if url.path in ('/v5/order/cancel', '/api/v5/trade/cancel-order'):
+                if self.cancel_timeout:
+                    raise TimeoutError('mocked cancel timeout')
+                class Response:
+                    def __enter__(self): return self
+                    def __exit__(self, *_): return False
+                    def read(self, limit): return json.dumps({'retCode': 0} if venue == 'bybit' else {'code': '0'}).encode()
+                return Response()
+            if self.fail_post == venue:
+                raise TimeoutError('mocked transport timeout')
+            if self.reject_post == venue:
+                class Response:
+                    def __enter__(self): return self
+                    def __exit__(self, *_): return False
+                    def read(self, limit): return json.dumps({'retCode': 10001} if venue == 'bybit' else {'code': '1'}).encode()
+                return Response()
+            fields = json.loads(request.data)
+            order_id = str(len(self.orders) + 1)
+            self.orders[order_id] = (venue, fields)
+            is_close = fields.get('reduceOnly') is True
+            if venue == 'bybit':
+                pos = self.responses[('bybit', '/v5/position/list')]['result']['list'][0]
+                pos.update(size='0' if is_close else fields['qty'], side='' if is_close else fields['side'])
+                payload = {'retCode': 0, 'result': {'orderId': order_id}}
+            else:
+                rows = [] if is_close else [{'instId': fields['instId'], 'posSide': 'net', 'mgnMode': 'cross',
+                                              'pos': ('-' if fields['side'] == 'sell' else '') + fields['sz']}]
+                self.responses[('okx', '/api/v5/account/positions')] = okx(rows)
+                payload = {'code': '0', 'data': [{'sCode': '0', 'ordId': order_id}]}
+        elif venue == 'bybit' and url.path in ('/v5/order/realtime', '/v5/order/history') and 'orderLinkId' in query and venue in self.terminal:
+            client = query['orderLinkId'][0]
+            order_id, (_, fields) = next((oid, item) for oid, item in self.orders.items()
+                                         if item[0] == venue and item[1]['orderLinkId'] == client)
+            payload = bybit({'list': [{'orderId': order_id, 'orderLinkId': client, 'symbol': fields['symbol'],
+                                       'side': fields['side'], 'orderStatus': self.terminal[venue]}], 'nextPageCursor': ''})
+        elif (venue == 'bybit' and url.path == '/v5/order/realtime' and 'orderId' in query) or (
+                venue == 'okx' and url.path == '/api/v5/trade/order' and 'ordId' in query):
+            order_id = query['orderId' if venue == 'bybit' else 'ordId'][0]
+            actual, fields = self.orders[order_id]
+            assert actual == venue
+            partial = self.partial == venue
+            if venue == 'bybit':
+                payload = bybit({'list': [{'orderId': order_id, 'orderLinkId': fields['orderLinkId'],
+                    'symbol': fields['symbol'], 'side': fields['side'], 'orderStatus': 'PartiallyFilled' if partial else 'Filled',
+                    'cumExecQty': '0.001' if partial else fields['qty'], 'avgPrice': '100000',
+                    'reduceOnly': fields.get('reduceOnly', False)}]})
+            else:
+                payload = okx([{'ordId': order_id, 'clOrdId': fields['clOrdId'], 'instId': fields['instId'],
+                    'side': fields['side'], 'state': 'partially_filled' if partial else 'filled',
+                    'accFillSz': '0.3' if partial else fields['sz'], 'avgPx': '100000',
+                    'reduceOnly': 'true' if fields.get('reduceOnly') is True else 'false'}])
+        else:
+            path = url.path
+            if venue == 'bybit' and path == '/v5/order/realtime' and query.get('orderFilter') == ['StopOrder']:
+                path += '#conditional'
+            payload = self.responses[(venue, path)]
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self, limit): return json.dumps(payload).encode()
+        return Response()
+
+
+def test_integrated_open_confirm_close_with_no_preflight_or_transport_bypass(exchange, monkeypatch):
+    responses, _ = exchange
+    for key in (('okx', '/api/v5/public/funding-rate'), ('okx', '/api/v5/account/trade-fee'),
+                ('bybit', '/v5/account/fee-rate'), ('bybit', '/v5/market/orderbook'), ('okx', '/api/v5/market/books')):
+        responses.pop(key)
+    fake = LifecycleExchange(responses)
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    result = demo.execute_pair(pair(), confirmed=True, risk_limits=limits())
+    assert result['state'] == 'open_confirmed' and result['confirmed_legs'] == 2
+    result = demo.close_pair(confirmed=True, close_confirmed=True, risk_limits=limits())
+    assert result['state'] == 'closed_confirmed' and result['confirmed_closes'] == 2
+    posted = [(urlsplit(req.full_url).hostname, json.loads(req.data)) for req in fake.calls if req.method == 'POST']
+    assert [host for host, _ in posted] == ['api-demo.bybit.com', 'www.okx.com', 'www.okx.com', 'api-demo.bybit.com']
+    assert all('reduceOnly' not in fields for _, fields in posted[:2])
+    assert all(fields['reduceOnly'] is True for _, fields in posted[2:])
+    assert not any(urlsplit(req.full_url).path in ('/v5/execution/list', '/api/v5/trade/fills') for req in fake.calls)
+    assert responses[('bybit', '/v5/position/list')]['result']['list'][0]['size'] == '0'
+    assert responses[('okx', '/api/v5/account/positions')]['data'] == []
+    result = demo.execute_pair(pair(), confirmed=True, risk_limits=limits())
+    assert result['state'] == 'open_confirmed'
+    assert len(list(demo._journal_path().parent.glob('demo-futures-closed-*.json'))) == 1
+
+
+def test_pure_futures_demo_signal_runs_full_cycle_offline(exchange, monkeypatch, capsys):
+    from execution.run_pure_futures_spread import run_once
+    from cli import pure_futures_trade
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    cfg = {'dry_run': False, 'pureFuturesArbitrage': {'demoBase': 'BTC', 'tradeUsdPerPair': '2000'}}
+    result = run_once(cfg)
+    assert result['signal']['long_venue'] == 'bybit' and result['signal']['short_venue'] == 'okx'
+    assert result['actions'][0]['result']['state'] == 'open_confirmed'
+    monkeypatch.setattr(sys, 'argv', ['trade', 'demo-positions', 'BTC'])
+    assert pure_futures_trade.main() == 0
+    displayed = json.loads(capsys.readouterr().out)
+    assert displayed['bybit']['positions'][0]['size'] == '0.018'
+    assert displayed['okx']['positions'][0]['pos'] == '-1.8'
+    monkeypatch.setattr(sys, 'argv', ['trade', 'demo-stop'])
+    assert pure_futures_trade.main() == 0
+    capsys.readouterr()
+    with pytest.raises(demo.DemoBlocked, match='openings'):
+        demo.execute_pair(pair(), confirmed=True, risk_limits=limits())
+    monkeypatch.setattr(sys, 'argv', ['trade', 'demo-close', '--confirm'])
+    assert pure_futures_trade.main() == 0
+    assert json.loads(capsys.readouterr().out)['state'] == 'closed_confirmed'
+    assert len([req for req in fake.calls if req.method == 'POST']) == 4
+
+
+def test_demo_cli_mode_enable_and_manual_open(exchange, monkeypatch, capsys):
+    from cli import pure_futures_trade
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    monkeypatch.setattr(sys, 'argv', ['trade', 'demo-mode'])
+    assert pure_futures_trade.main() == 0 and json.loads(capsys.readouterr().out)['orders_enabled'] is False
+    monkeypatch.setattr(sys, 'argv', ['trade', 'demo-enable', '--confirm'])
+    assert pure_futures_trade.main() == 0 and json.loads(capsys.readouterr().out)['orders_enabled'] is True
+    monkeypatch.setattr(sys, 'argv', ['trade', 'demo-open', 'BTC', '--long-venue', 'bybit', '--short-venue', 'okx',
+                                      '--trade-usd', '2000', '--confirm'])
+    assert pure_futures_trade.main() == 0
+    assert json.loads(capsys.readouterr().out)['state'] == 'open_confirmed'
+    assert len([req for req in fake.calls if req.method == 'POST']) == 2
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'partial', 'rejected'])
+def test_integrated_first_leg_unknown_or_partial_never_submits_second(exchange, monkeypatch, failure):
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    if failure == 'timeout':
+        fake.fail_post = 'bybit'
+    elif failure == 'partial':
+        fake.partial = 'bybit'
+    else:
+        fake.reject_post = 'bybit'
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    result = demo.execute_pair(pair(), confirmed=True, risk_limits=limits())
+    assert result['state'] == 'reconciliation_required'
+    assert len([req for req in fake.calls if req.method == 'POST']) == 1
+    with pytest.raises(demo.DemoBlocked, match='reconciliation'):
+        demo.execute_pair(pair(), confirmed=True, risk_limits=limits())
+    assert len([req for req in fake.calls if req.method == 'POST']) == 1
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'partial', 'rejected'])
+def test_integrated_second_leg_failure_preserves_first_without_rollback(exchange, monkeypatch, failure):
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    if failure == 'timeout':
+        fake.fail_post = 'okx'
+    elif failure == 'partial':
+        fake.partial = 'okx'
+    else:
+        fake.reject_post = 'okx'
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    result = demo.execute_pair(pair(), confirmed=True, risk_limits=limits())
+    assert result['state'] == 'reconciliation_required' and result['confirmed_legs'] == 1
+    assert len([req for req in fake.calls if req.method == 'POST']) == 2
+    with pytest.raises(demo.DemoBlocked, match='reconciliation'):
+        demo.execute_pair(pair(), confirmed=True, risk_limits=limits())
+    assert len([req for req in fake.calls if req.method == 'POST']) == 2
+
+
+@pytest.mark.parametrize(('failure', 'venue', 'close_requests'), [
+    ('timeout', 'okx', 1), ('partial', 'okx', 1), ('timeout', 'bybit', 2),
+])
+def test_close_unknown_or_partial_never_retries(exchange, monkeypatch, failure, venue, close_requests):
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    assert demo.execute_pair(pair(), confirmed=True, risk_limits=limits())['state'] == 'open_confirmed'
+    if failure == 'timeout':
+        fake.fail_post = venue
+    else:
+        fake.partial = venue
+    assert demo.close_pair(confirmed=True, close_confirmed=True, risk_limits=limits())['state'] == 'close_reconciliation_required'
+    assert len([req for req in fake.calls if req.method == 'POST']) == 2 + close_requests
+    with pytest.raises(demo.DemoBlocked):
+        demo.close_pair(confirmed=True, close_confirmed=True, risk_limits=limits())
+    assert len([req for req in fake.calls if req.method == 'POST']) == 2 + close_requests
+
+
+def test_demo_transport_rejects_tampered_production_host_before_network(exchange, monkeypatch):
+    _, calls = exchange
+    monkeypatch.setitem(demo._BASES, 'bybit', 'https://api.bybit.com')
+    with pytest.raises(data.DemoDataBlocked):
+        data.read('bybit', 'BTC', 'instrument')
+    token = demo._PAIR_ACTIVE.set(True)
+    try:
+        with pytest.raises(demo.DemoBlocked, match='endpoint'):
+            demo._request('bybit', 'POST', None,
+                          demo._order_fields('bybit', 'BTC', 'buy', '0.018', 'testclient'), True)
+    finally:
+        demo._PAIR_ACTIVE.reset(token)
+    assert not calls
+
+
+@pytest.mark.parametrize(('venue', 'name'), [('bybit', 'BYBIT_API_KEY'), ('bybit', 'BYBIT_TESTNET_API_KEY'),
+                                             ('okx', 'OKX_API_KEY')])
+def test_known_production_or_testnet_key_cannot_be_used_as_demo(exchange, monkeypatch, venue, name):
+    _, calls = exchange
+    monkeypatch.setenv(name, venue + '-dummy-key')
+    with pytest.raises(data.DemoDataBlocked):
+        data.read(venue, 'BTC', 'instrument')
+    assert not calls
+
+
+@pytest.mark.parametrize('timeout', [False, True])
+def test_cancel_uncertain_order_is_journalled_once_without_retry(exchange, monkeypatch, timeout):
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    fake.partial = 'bybit'
+    fake.cancel_timeout = timeout
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    assert demo.execute_pair(pair(), confirmed=True, risk_limits=limits())['state'] == 'reconciliation_required'
+    record = json.loads(demo._journal_path().read_text())
+    client_id = record['legs'][0]['request']['orderLinkId']
+    with pytest.raises(demo.DemoBlocked):
+        demo.cancel_pending('bybit', 'otherclient', confirmed=True)
+    assert demo.cancel_pending('bybit', client_id, confirmed=True)['state'] == 'cancel_reconciliation_required'
+    assert json.loads(demo._journal_path().read_text())['state'] == 'cancel_reconciliation_required'
+    with pytest.raises(demo.DemoBlocked):
+        demo.cancel_pending('bybit', client_id, confirmed=True)
+    cancels = [req for req in fake.calls if urlsplit(req.full_url).path == '/v5/order/cancel']
+    assert len(cancels) == 1 and json.loads(cancels[0].data)['orderLinkId'] == client_id
+
+
+def test_okx_cancel_always_uses_demo_header_and_known_client_id(exchange, monkeypatch):
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    fake.partial = 'okx'
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    reverse = demo.FuturesPair('BTC', 'okx', 'bybit', '0.018', '1.8', '0.01')
+    assert demo.execute_pair(reverse, confirmed=True, risk_limits=limits())['state'] == 'reconciliation_required'
+    record = json.loads(demo._journal_path().read_text())
+    client_id = record['legs'][0]['request']['clOrdId']
+    assert demo.cancel_pending('okx', client_id, confirmed=True)['state'] == 'cancel_reconciliation_required'
+    cancel = [req for req in fake.calls if urlsplit(req.full_url).path == '/api/v5/trade/cancel-order']
+    assert len(cancel) == 1 and json.loads(cancel[0].data)['clOrdId'] == client_id
+    assert {k.lower(): v for k, v in cancel[0].header_items()}['x-simulated-trading'] == '1'
+
+
+def test_insufficient_demo_margin_rejects_before_first_order(exchange, monkeypatch):
+    responses, _ = exchange
+    responses[('okx', '/api/v5/account/balance')]['data'][0]['details'][0]['availEq'] = '1'
+    fake = LifecycleExchange(responses)
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    with pytest.raises(demo.DemoBlocked, match='preflight'):
+        demo.execute_pair(pair(), confirmed=True, risk_limits=limits())
+    assert all(req.method == 'GET' for req in fake.calls) and not demo._journal_path().exists()
+
+
+def test_manual_resolution_requires_terminal_status_and_flat_accounts(exchange, monkeypatch):
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    fake.partial = 'bybit'
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    assert demo.execute_pair(pair(), confirmed=True, risk_limits=limits())['state'] == 'reconciliation_required'
+    record = json.loads(demo._journal_path().read_text())
+    client_id = record['legs'][0]['request']['orderLinkId']
+    assert demo.cancel_pending('bybit', client_id, confirmed=True)['state'] == 'cancel_reconciliation_required'
+    responses[('bybit', '/v5/position/list')]['result']['list'][0].update(size='0', side='')
+    before = demo._journal_path().read_bytes()
+    with pytest.raises(demo.DemoBlocked):
+        demo.resolve_pending_flat(confirmed=True)
+    assert demo._journal_path().read_bytes() == before  # Missing status is never treated as terminal.
+    fake.terminal['bybit'] = 'Cancelled'
+    responses[('okx', '/api/v5/account/positions')] = okx([{'instId': 'BTC-USDT-SWAP', 'posSide': 'net', 'pos': '-0.3'}])
+    with pytest.raises(demo.DemoBlocked):
+        demo.resolve_pending_flat(confirmed=True)
+    assert demo._journal_path().read_bytes() == before  # Residual position still blocks release.
+    responses[('okx', '/api/v5/account/positions')] = okx([])
+    responses[('okx', '/api/v5/trade/orders-pending')] = okx([{'ordId': 'still-open'}])
+    with pytest.raises(demo.DemoBlocked):
+        demo.resolve_pending_flat(confirmed=True)
+    assert demo._journal_path().read_bytes() == before
+    responses[('okx', '/api/v5/trade/orders-pending')] = okx([])
+    assert demo.resolve_pending_flat(confirmed=True)['state'] == 'manually_resolved_flat'
+    assert not demo._journal_path().exists()
+    assert len(list(demo._journal_path().parent.glob('demo-futures-resolved-*.json'))) == 1
+
+
+def test_manual_resolution_rejects_conflicting_terminal_statuses(exchange):
+    responses, calls = exchange
+    add_order_lookup_fixtures(responses)
+    responses[('bybit', '/v5/order/history')]['result']['list'][0]['orderStatus'] = 'Cancelled'
+    with pytest.raises(data.DemoDataBlocked):
+        data.verify_terminal_order('bybit', 'BTC', journal_record(1)['legs'][0]['request'], max_age_ms=10_000)
+    assert calls and all(req.method == 'GET' for req in calls)
