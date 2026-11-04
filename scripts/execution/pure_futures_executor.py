@@ -14,6 +14,7 @@ liquidation monitoring, or funding period mismatch (Phase 2 risk controls)."""
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import tempfile
@@ -154,19 +155,32 @@ def _check_futures_margin(
     """Verify futures USDT >= required; if insufficient, attempt earn->spot->futures chain.
 
     Chain: futures low -> transfer from spot -> spot low -> redeem from earn -> transfer again.
-    Returns False if margin is confirmed insufficient (should abort opening).
-    On balance API errors, skip verification (don't block trades on transient API failures).
+    Missing, invalid or insufficient balance aborts the opening.
     """
     try:
         balances = venue.fetch_usdt_account_balances()
-    except Exception as e:
-        logs.append(f"{venue_id}: margin query failed, skipping check ({e})")
-        return True
-    futures_avail = float(balances.get("futures", 0) or 0)
+        value = balances["futures"]
+        if isinstance(value, bool) or isinstance(required_usd, bool):
+            raise ValueError("invalid balance")
+        futures_avail = float(value)
+        if not math.isfinite(futures_avail) or futures_avail < 0 or not math.isfinite(required_usd) or required_usd <= 0:
+            raise ValueError("invalid balance")
+    except Exception:
+        logs.append(f"{venue_id}: margin query failed or returned invalid data; opening blocked")
+        return False
     if futures_avail >= required_usd:
         return True
     shortfall = required_usd - futures_avail
-    spot_avail = float(balances.get("spot", 0) or 0)
+    try:
+        spot_value = balances.get("spot", 0)
+        if isinstance(spot_value, bool):
+            raise ValueError("invalid spot balance")
+        spot_avail = float(spot_value)
+        if not math.isfinite(spot_avail) or spot_avail < 0:
+            raise ValueError("invalid spot balance")
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        logs.append(f"{venue_id}: spot balance invalid; opening blocked")
+        return False
 
     # Step 1: earn → spot (Bitget only, only when spot is insufficient)
     if spot_avail < shortfall and venue_id == "bitget":
@@ -182,10 +196,17 @@ def _check_futures_margin(
     if spot_avail >= shortfall:
         try:
             if venue.transfer_asset(quote, shortfall, "spot", "futures"):
-                logs.append(f"{venue_id}: spot->futures transfer {shortfall:.2f} {quote}")
-                return True
-        except Exception as e:
-            logs.append(f"{venue_id}: transfer failed ({e})")
+                refreshed = venue.fetch_usdt_account_balances()["futures"]
+                if isinstance(refreshed, bool):
+                    raise ValueError("invalid balance")
+                refreshed_avail = float(refreshed)
+                if math.isfinite(refreshed_avail) and refreshed_avail >= required_usd:
+                    logs.append(f"{venue_id}: spot->futures transfer confirmed")
+                    return True
+                logs.append(f"{venue_id}: futures balance after transfer unconfirmed; opening blocked")
+                return False
+        except Exception:
+            logs.append(f"{venue_id}: transfer or post-transfer balance check failed")
     logs.append(
         f"{venue_id}: insufficient margin futures={futures_avail:.2f} "
         f"spot={spot_avail:.2f} need {required_usd:.2f}"
@@ -382,9 +403,8 @@ def open_pure_futures_pair(
     margin_usd = (
         trade_usd * MARGIN_BUFFER + trade_usd * max(capital_buffer_pct, 0.0) / 100.0
     )
-    ok_long = _check_futures_margin(lv, long_venue_id, quote, margin_usd, logs)
-    ok_short = _check_futures_margin(sv, short_venue_id, quote, margin_usd, logs)
-    if not (ok_long and ok_short):
+    if (not _check_futures_margin(lv, long_venue_id, quote, margin_usd, logs) or
+            not _check_futures_margin(sv, short_venue_id, quote, margin_usd, logs)):
         # Abort before first order to avoid single-leg fill and rollback
         return CrossVenueResult(False, "aborted", "", executed, logs)
     for venue, mkt in ((lv, long_mkt), (sv, short_mkt)):

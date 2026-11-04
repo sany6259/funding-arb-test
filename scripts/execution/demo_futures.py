@@ -454,9 +454,7 @@ def reconcile_pending(*, confirmed: bool = False, risk_limits=None) -> dict[str,
                 len(record['legs']) != 2):
             raise DemoBlocked('Pending journal invalid')
         if record['state'].startswith(('close_', 'closed_')):
-            # Closing-order recovery must not be confused with opening fills.
-            return {'state': 'manual_reconciliation_required', 'confirmed_legs': 0,
-                    'confirmed_leg_evidence_checked': False}
+            return _reconcile_closing(path, record, risk_limits)
         legs = record['legs']
         if any(not isinstance(leg, dict) or leg.get('venue') not in _VENUES or not isinstance(leg.get('request'), dict) for leg in legs):
             raise DemoBlocked('Pending journal invalid')
@@ -530,7 +528,7 @@ def reconcile_pending(*, confirmed: bool = False, risk_limits=None) -> dict[str,
         os.close(lock_fd)
 
 
-def _read_open_journal_for_close(path: Path) -> tuple[FuturesPair, dict[str, Any]]:
+def _read_open_journal_for_close(path: Path, *, allowed_states: frozenset[str] = frozenset({'position_reconciliation_required'})) -> tuple[FuturesPair, dict[str, Any]]:
     """Load only a fully confirmed opening journal; reject old/ambiguous data."""
     import stat
     try:
@@ -547,7 +545,7 @@ def _read_open_journal_for_close(path: Path) -> tuple[FuturesPair, dict[str, Any
             raise ValueError('unsafe journal')
         record = json.loads(raw)
         if (not isinstance(record, dict) or type(record.get('version')) is not int or record['version'] != 1 or
-                record.get('state') != 'position_reconciliation_required' or not isinstance(record.get('id'), str) or
+                record.get('state') not in allowed_states or not isinstance(record.get('id'), str) or
                 not re.fullmatch(r'[a-f0-9]{32}', record['id']) or not isinstance(record.get('legs'), list) or
                 len(record['legs']) != 2):
             raise ValueError('unconfirmed opening')
@@ -579,6 +577,82 @@ def _read_open_journal_for_close(path: Path) -> tuple[FuturesPair, dict[str, Any
         return pair, record
     except Exception:
         raise DemoBlocked('Opening journal unavailable, ambiguous or not fully confirmed') from None
+
+
+def _reconcile_closing(path: Path, record: dict[str, Any], risk_limits) -> dict[str, Any]:
+    """Read-only recovery of a closing intent; never retry or clear the journal."""
+    from execution import demo_futures_data
+    state = record['state']
+    result = {'state': 'manual_reconciliation_required', 'confirmed_legs': 0,
+              'confirmed_leg_evidence_checked': False, 'confirmed_closes': 0,
+              'close_evidence_checked': False, 'reason': 'order_unconfirmed'}
+    try:
+        pair, saved = _read_open_journal_for_close(path, allowed_states=frozenset({state}))
+        if saved != record:
+            raise ValueError('Journal changed')
+        closing = saved['closing']
+        if not isinstance(closing, list) or len(closing) != 2:
+            raise ValueError('Closing intent missing')
+        client_ids = {leg['request']['orderLinkId' if leg['venue'] == 'bybit' else 'clOrdId']
+                      for leg in saved['legs']}
+        for index, original in enumerate(reversed(saved['legs'])):
+            leg = closing[index]
+            venue = original['venue']
+            if not isinstance(leg, dict) or leg.get('venue') != venue:
+                raise ValueError('Closing venue mismatch')
+            fields = leg['request']
+            _validate_route(venue, 'POST', None, fields)
+            symbol = 'symbol' if venue == 'bybit' else 'instId'
+            amount = 'qty' if venue == 'bybit' else 'sz'
+            client = fields['orderLinkId' if venue == 'bybit' else 'clOrdId']
+            if (fields.get('reduceOnly') is not True or fields[symbol] != original['request'][symbol] or
+                    fields['side'].lower() == original['request']['side'].lower() or
+                    _quantity(fields[amount]) != _quantity(original['request'][amount]) or client in client_ids):
+                raise ValueError('Closing request mismatch')
+            client_ids.add(client)
+            known = leg.get('order_id')
+            if known is not None and (not isinstance(known, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', known)):
+                raise ValueError('Invalid exchange identifier')
+            confirmation = leg.get('confirmation')
+            if confirmation is not None and (not isinstance(confirmation, dict) or known is None or
+                                             confirmation.get('order_id') != known):
+                raise ValueError('Invalid recorded confirmation')
+        if state == 'close_prepared':
+            result['reason'] = 'close_not_submitted'
+            return result
+        if state.startswith('close_1_'):
+            possible = 1
+        elif state.startswith('close_2_') or state == 'closed_observed_manual_review':
+            possible = 2
+        else:
+            possible = 2 if closing[0].get('confirmation') is not None else 1
+        for leg in closing[:possible]:
+            try:
+                observed = demo_futures_data.lookup_confirmation(
+                    leg['venue'], pair.base, leg['request'], order_id=leg.get('order_id'),
+                    max_age_ms=risk_limits.max_snapshot_age_ms)
+            except demo_futures_data.DemoDataBlocked:
+                break
+            prior = leg.get('confirmation')
+            if prior is not None and (prior.get('venue') != observed['venue'] or
+                                      _quantity(prior.get('filled_qty')) != _quantity(observed['filled_qty']) or
+                                      _quantity(prior.get('avg_price')) != _quantity(observed['avg_price'])):
+                raise ValueError('Conflicting confirmations')
+            leg['order_id'] = observed['order_id']
+            leg['confirmation'] = observed
+            result['confirmed_closes'] += 1
+        if result['confirmed_closes']:
+            try:
+                demo_futures_data.verify_close_step(pair, saved['legs'], closing, result['confirmed_closes'],
+                                                   max_age_ms=risk_limits.max_snapshot_age_ms)
+                result['close_evidence_checked'] = True
+                result['reason'] = ('read_only_close_evidence_consistent' if result['confirmed_closes'] == possible
+                                    else 'order_unconfirmed')
+            except demo_futures_data.DemoDataBlocked:
+                result['reason'] = 'positions_or_executions_unconfirmed'
+        return result
+    except Exception:
+        raise DemoBlocked('Closing journal unavailable or invalid') from None
 
 
 def close_pair(*, confirmed: bool = False, close_confirmed: bool = False, risk_limits=None) -> dict[str, Any]:

@@ -91,7 +91,8 @@ def read(venue: str, base: str, resource: str, *, cursor: str | None = None,
             raise DemoDataBlocked('Invalid order identifier')
     elif client_id is not None or order_id is not None:
         raise DemoDataBlocked('Identifier is not valid for this resource')
-    if cursor is not None and (resource != 'fills' or not isinstance(cursor, str) or
+    paged = resource == 'fills' or (venue == 'bybit' and resource == 'lookup_history')
+    if cursor is not None and (not paged or not isinstance(cursor, str) or
                                not re.fullmatch(r'[A-Za-z0-9%_:.=+\-]{1,512}', cursor) or
                                (venue == 'okx' and not re.fullmatch(r'[0-9]{1,32}', cursor))):
         raise DemoDataBlocked('Invalid pagination cursor')
@@ -343,8 +344,8 @@ def collect(venue: str, base: str, side: str, quantity: str) -> VenueSnapshot:
 def verify_step(pair: demo.FuturesPair, legs: list[dict[str, Any]], confirmed_count: int, *, max_age_ms: int) -> None:
     """Read demo executions and both positions; never place or retry an order.
 
-    A bounded, non-paginated history is required. This routine blocks if any
-    execution, position, order or source time is ambiguous.
+    Execution history is paginated with a fixed limit. This routine blocks if
+    any execution, position, order or source time is ambiguous.
     """
     if (not isinstance(legs, list) or len(legs) != 2 or type(confirmed_count) is not int or confirmed_count not in (1, 2) or
             isinstance(max_age_ms, bool) or not isinstance(max_age_ms, int) or max_age_ms <= 0):
@@ -457,20 +458,41 @@ def lookup_confirmation(venue: str, base: str, fields: dict[str, Any], *, order_
         reads = []
         exchange_times = []
         rows: list[dict[str, Any]] = []
+        def lookup(resource: str, **identifier: str) -> list[dict[str, Any]]:
+            result_rows: list[dict[str, Any]] = []
+            cursor = None
+            seen: set[str] = set()
+            for _ in range(20):
+                kwargs = dict(identifier)
+                if cursor is not None:
+                    kwargs['cursor'] = cursor
+                result = read(venue, base, resource, **kwargs)
+                reads.append(result)
+                if venue == 'bybit':
+                    payload = result.payload['result']
+                    batch = payload['list']
+                    token = payload['nextPageCursor']
+                    exchange_times.append(_stamp(result.payload['time']))
+                    if not isinstance(token, str) or (resource != 'lookup_history' and token):
+                        raise ValueError('Incomplete current order lookup')
+                else:
+                    batch = result.payload['data']
+                    token = ''
+                if not isinstance(batch, list) or not all(isinstance(row, dict) for row in batch):
+                    raise ValueError('Invalid order lookup')
+                result_rows.extend(batch)
+                if len(result_rows) > 1:
+                    raise ValueError('Duplicate or ambiguous order')
+                if not token:
+                    return result_rows
+                if token in seen:
+                    raise ValueError('Repeated order history cursor')
+                seen.add(token)
+                cursor = token
+            raise ValueError('Order history exceeds page limit')
+
         for resource in resources:
-            result = read(venue, base, resource, client_id=client)
-            reads.append(result)
-            if venue == 'bybit':
-                payload = result.payload['result']
-                batch = payload['list']
-                if payload['nextPageCursor'] != '':
-                    raise ValueError('Incomplete order history')
-                exchange_times.append(_stamp(result.payload['time']))
-            else:
-                batch = result.payload['data']
-            if not isinstance(batch, list) or len(batch) > 1 or not all(isinstance(row, dict) for row in batch):
-                raise ValueError('Duplicate or ambiguous order')
-            rows.extend(batch)
+            rows.extend(lookup(resource, client_id=client))
         if not rows:
             raise ValueError('Order unavailable')
         resolved = rows[0].get('orderId' if venue == 'bybit' else 'ordId')
@@ -481,18 +503,7 @@ def lookup_confirmation(venue: str, base: str, fields: dict[str, Any], *, order_
                 raise ValueError('Order id mismatch')
             found_by_order_id = False
             for resource in resources:
-                result = read(venue, base, resource, order_id=order_id)
-                reads.append(result)
-                if venue == 'bybit':
-                    payload = result.payload['result']
-                    batch = payload['list']
-                    if payload['nextPageCursor'] != '':
-                        raise ValueError('Incomplete order history')
-                    exchange_times.append(_stamp(result.payload['time']))
-                else:
-                    batch = result.payload['data']
-                if not isinstance(batch, list) or len(batch) > 1 or not all(isinstance(row, dict) for row in batch):
-                    raise ValueError('Ambiguous order lookup')
+                batch = lookup(resource, order_id=order_id)
                 found_by_order_id = found_by_order_id or bool(batch)
                 rows.extend(batch)
             if not found_by_order_id:

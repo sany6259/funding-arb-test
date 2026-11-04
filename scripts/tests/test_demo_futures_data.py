@@ -465,6 +465,38 @@ def test_lookup_rejects_duplicate_orders_and_incomplete_history(exchange):
         data.lookup_confirmation('bybit', 'BTC', confirmed_legs()[0]['request'], order_id=None, max_age_ms=10_000)
 
 
+def test_lookup_follows_order_history_pages_for_both_identifiers(exchange, monkeypatch):
+    responses, calls = exchange
+    add_order_lookup_fixtures(responses)
+    row = responses[('bybit', '/v5/order/history')]['result']['list'][0]
+    original = data.read
+    pages = []
+    def paged(venue, base, resource, **kwargs):
+        if resource == 'lookup_history':
+            pages.append((kwargs.get('client_id'), kwargs.get('order_id'), kwargs.get('cursor')))
+            if kwargs.get('cursor') is None:
+                return data.ReadResult(bybit({'list': [], 'nextPageCursor': 'page-2'}), NOW)
+            assert kwargs['cursor'] == 'page-2'
+            return data.ReadResult(bybit({'list': [row], 'nextPageCursor': ''}), NOW)
+        return original(venue, base, resource, **kwargs)
+    monkeypatch.setattr(data, 'read', paged)
+    result = data.lookup_confirmation('bybit', 'BTC', confirmed_legs()[0]['request'],
+                                      order_id='bybitorder', max_age_ms=10_000)
+    assert result['order_id'] == 'bybitorder'
+    assert pages == [('bybitclient', None, None), ('bybitclient', None, 'page-2'),
+                     (None, 'bybitorder', None), (None, 'bybitorder', 'page-2')]
+    assert all(req.method == 'GET' for req in calls)
+
+
+def test_history_cursor_is_sent_to_demo_endpoint_with_id(exchange):
+    _, calls = exchange
+    data.read('bybit', 'BTC', 'lookup_history', client_id='bybitclient', cursor='page-2')
+    req = calls[-1]
+    assert urlsplit(req.full_url).hostname == 'api-demo.bybit.com'
+    assert parse_qs(urlsplit(req.full_url).query)['cursor'] == ['page-2']
+    assert parse_qs(urlsplit(req.full_url).query)['orderLinkId'] == ['bybitclient']
+
+
 def test_restart_can_check_missing_ack_by_client_without_retry_or_clearing(exchange):
     responses, calls = exchange
     add_reconciliation_fixtures(responses)
@@ -569,6 +601,91 @@ def test_close_restart_remains_manual_and_never_retries(exchange):
     assert inspect_journal().state == 'close_1_submitting'
     result = demo.reconcile_pending(confirmed=True, risk_limits=limits())
     assert result['state'] == 'manual_reconciliation_required' and not result['confirmed_leg_evidence_checked']
+    assert path.read_bytes() == before and all(req.method == 'GET' for req in calls)
+
+
+def test_close_restart_reads_both_fills_and_zero_positions_without_clearing(exchange, monkeypatch):
+    responses, calls = exchange
+    close_fixtures(responses, both=True)
+    record = journal_record(2)
+    record['state'] = 'close_2_submitting'
+    record['closing'] = close_legs()
+    record['closing'][1].pop('order_id')
+    record['closing'][1].pop('confirmation')
+    path = demo._journal_path()
+    demo._write_journal(path, record)
+    original_journal = path.read_bytes()
+    original_read = data.read
+    lookups = []
+    def route(venue, base, resource, **kwargs):
+        if resource.startswith('lookup_'):
+            lookups.append((venue, resource, kwargs))
+            if venue == 'bybit':
+                row = {'orderId': 'bybitcloseorder', 'orderLinkId': 'bybitclose', 'symbol': 'BTCUSDT',
+                       'side': 'Sell', 'orderStatus': 'Filled', 'cumExecQty': '0.018',
+                       'avgPrice': '100000', 'reduceOnly': True}
+                return data.ReadResult(bybit({'list': [row], 'nextPageCursor': ''}), NOW)
+            row = {'ordId': 'okxcloseorder', 'clOrdId': 'okxclose', 'instId': 'BTC-USDT-SWAP',
+                   'side': 'buy', 'state': 'filled', 'accFillSz': '1.8',
+                   'avgPx': '100000', 'reduceOnly': True}
+            return data.ReadResult(okx([row]), NOW)
+        return original_read(venue, base, resource, **kwargs)
+    monkeypatch.setattr(data, 'read', route)
+    result = demo.reconcile_pending(confirmed=True, risk_limits=limits())
+    assert result['state'] == 'manual_reconciliation_required'
+    assert result['confirmed_closes'] == 2 and result['close_evidence_checked'] is True
+    assert any(item[0] == 'bybit' and item[2].get('client_id') == 'bybitclose' for item in lookups)
+    assert path.read_bytes() == original_journal and all(req.method == 'GET' for req in calls)
+
+
+def test_close_restart_rejects_changed_reduce_only_intent_before_lookup(exchange):
+    _, calls = exchange
+    record = journal_record(2)
+    record['state'] = 'close_1_submitting'
+    record['closing'] = close_legs()
+    record['closing'][0]['request'].pop('reduceOnly')
+    path = demo._journal_path()
+    demo._write_journal(path, record)
+    before = path.read_bytes()
+    with pytest.raises(demo.DemoBlocked):
+        demo.reconcile_pending(confirmed=True, risk_limits=limits())
+    assert path.read_bytes() == before and not calls
+
+
+@pytest.mark.parametrize('state', ['partially_filled', 'live', 'canceled'])
+def test_close_restart_unconfirmed_order_blocks_and_preserves_journal(exchange, state):
+    responses, calls = exchange
+    record = journal_record(2)
+    record['state'] = 'close_1_submitting'
+    record['closing'] = close_legs()
+    record['closing'][0].pop('confirmation')
+    record['closing'][0].pop('order_id')
+    responses[('okx', '/api/v5/trade/order')] = okx([{
+        'ordId': 'okxcloseorder', 'clOrdId': 'okxclose', 'instId': 'BTC-USDT-SWAP',
+        'side': 'buy', 'state': state, 'accFillSz': '0.9', 'avgPx': '100000', 'reduceOnly': True,
+    }])
+    path = demo._journal_path()
+    demo._write_journal(path, record)
+    before = path.read_bytes()
+    result = demo.reconcile_pending(confirmed=True, risk_limits=limits())
+    assert result['state'] == 'manual_reconciliation_required'
+    assert result['reason'] == 'order_unconfirmed' and result['confirmed_closes'] == 0
+    assert path.read_bytes() == before and calls and all(req.method == 'GET' for req in calls)
+
+
+def test_close_restart_lost_exchange_response_stays_blocked(exchange, monkeypatch):
+    _, calls = exchange
+    record = journal_record(2)
+    record['state'] = 'close_1_submitting'
+    record['closing'] = close_legs()
+    path = demo._journal_path()
+    demo._write_journal(path, record)
+    before = path.read_bytes()
+    def unavailable(*args, **kwargs):
+        raise data.DemoDataBlocked('exchange unavailable')
+    monkeypatch.setattr(data, 'read', unavailable)
+    result = demo.reconcile_pending(confirmed=True, risk_limits=limits())
+    assert result['state'] == 'manual_reconciliation_required' and result['reason'] == 'order_unconfirmed'
     assert path.read_bytes() == before and not calls
 
 
