@@ -36,9 +36,11 @@ def current_mode() -> str:
 @router.get("/execution-mode")
 async def execution_mode():
     try:
-        mode = current_mode()
+        state = shared_mode.current_state()
+        mode = state['mode']
         return {"mode": mode, "environment": "demo" if mode == "demo" else "none",
-                "orders_enabled": False, "live_supported": False}
+                "orders_enabled": state['orders_enabled'], "openings_enabled": state['openings_enabled'],
+                "live_supported": False}
     except Exception:
         return JSONResponse(status_code=503, content={"error": "Состояние режима недоступно; ордера отключены."})
 
@@ -235,11 +237,12 @@ async def check_demo(request: Request):
             return _failure("Сначала сохраните демоключ.", 409)
         # The remote adapter has no credential fallback and fixes the demo endpoint and headers.
         balance = await asyncio.to_thread(_check, venue, creds['key'], creds['secret'], creds['passphrase'])
-        if current_mode() != 'demo':
+        state = shared_mode.current_state()
+        if state['mode'] != 'demo':
             return _failure("Режим изменился; повторите проверку.", 409)
         return {"venue": venue, "environment": "demo", "connected": True,
                 "credentials": "••••", "balance": {"asset": "USD" if venue == "bybit" else "USDT", "amount": balance,
                     "account_type": {"bybit": "Unified Account", "okx": "Trading Account", "bitget": "Spot Account"}[venue]},
-                "orders_enabled": False}
+                "orders_enabled": state['orders_enabled'], "openings_enabled": state['openings_enabled']}
     except Exception:
         return _failure("Проверка не пройдена: ошибка авторизации, баланса или связи с биржей.")

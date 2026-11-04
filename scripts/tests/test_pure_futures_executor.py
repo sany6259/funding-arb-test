@@ -7,6 +7,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -489,8 +491,8 @@ def test_open_margin_includes_capital_buffer():
     assert res2.ok
 
 
-def test_open_margin_check_skipped_when_api_fails():
-    """Balance API fails → skip check and allow through (don't block trading)."""
+def test_open_margin_check_blocks_when_api_fails():
+    """An unavailable balance must not permit either order."""
     path = _path("margin_api_fail")
     lv = FakeFuturesVenue("okx")
     sv = FakeFuturesVenue("bybit")
@@ -509,8 +511,31 @@ def test_open_margin_check_skipped_when_api_fails():
         short_venue=sv,
         positions_path=path,
     )
-    assert res.ok and res.state == "filled"
-    assert any("skipping check" in log for log in res.logs)
+    assert not res.ok and res.state == "aborted"
+    assert any("opening blocked" in log for log in res.logs)
+    assert lv.trades == [] and sv.trades == []
+
+
+@pytest.mark.parametrize('invalid', [None, float('nan'), float('inf'), -1, True, 'bad'])
+def test_open_margin_check_blocks_invalid_balance(invalid):
+    path = _path('margin_invalid')
+    lv = FakeFuturesVenue('okx', balances={'spot': 1000, 'futures': invalid})
+    sv = FakeFuturesVenue('bybit')
+    result = open_pure_futures_pair('BTC', 'okx', 'bybit', 500, dry_run=False,
+                                    long_venue=lv, short_venue=sv, positions_path=path)
+    assert not result.ok and result.state == 'aborted'
+    assert not lv.trades and not sv.trades and not lv.transfers
+
+
+def test_open_margin_check_requires_balance_confirmation_after_transfer():
+    path = _path('margin_transfer_unconfirmed')
+    lv = FakeFuturesVenue('okx', balances={'spot': 1000, 'futures': 100})
+    sv = FakeFuturesVenue('bybit')
+    lv.transfer_asset = lambda *args: True
+    result = open_pure_futures_pair('BTC', 'okx', 'bybit', 500, dry_run=False,
+                                    long_venue=lv, short_venue=sv, positions_path=path)
+    assert not result.ok and result.state == 'aborted'
+    assert not lv.trades and not sv.trades
 
 
 def test_close_spread_normal_no_warning():

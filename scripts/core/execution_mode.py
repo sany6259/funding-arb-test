@@ -38,19 +38,44 @@ def _locked():
             os.close(fd)
 
 
-def _read(directory: Path) -> str:
+def _read_state(directory: Path) -> dict:
     path = directory / 'execution-mode.json'
     if not path.exists():
-        return 'simulation'
+        return {'version': 1, 'mode': 'simulation', 'orders_enabled': False, 'openings_enabled': False}
     try:
         state = json.loads(path.read_text(encoding='utf-8'))
-        if not isinstance(state, dict) or set(state) != {'version', 'mode', 'orders_enabled'}:
+        if not isinstance(state, dict) or set(state) not in (
+                {'version', 'mode', 'orders_enabled'}, {'version', 'mode', 'orders_enabled', 'openings_enabled'}):
             raise ValueError('invalid state')
-        if state['version'] != 1 or state['mode'] not in _MODES or state['orders_enabled'] is not False:
+        if 'openings_enabled' not in state:
+            if state['orders_enabled'] is not False:
+                raise ValueError('invalid legacy state')
+            state['openings_enabled'] = False
+        if (type(state['version']) is not int or state['version'] != 1 or state['mode'] not in _MODES or
+                type(state['orders_enabled']) is not bool or type(state['openings_enabled']) is not bool or
+                (state['orders_enabled'] and state['mode'] != 'demo') or
+                (state['openings_enabled'] and not state['orders_enabled'])):
             raise ValueError('invalid state')
-        return state['mode']
+        return state
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         raise RuntimeError('invalid execution mode state') from None
+
+
+def _read(directory: Path) -> str:
+    return _read_state(directory)['mode']
+
+
+def _write_state(directory: Path, state: dict) -> None:
+    fd, tmp = tempfile.mkstemp(prefix='.execution-mode-', dir=directory)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as file:
+            json.dump(state, file)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp, directory / 'execution-mode.json')
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def current_mode() -> str:
@@ -63,17 +88,37 @@ def set_mode(mode: str) -> str:
         raise ValueError('unsupported execution mode')
     with _locked() as directory:
         _read(directory)  # Invalid state cannot be silently overwritten.
-        fd, tmp = tempfile.mkstemp(prefix='.execution-mode-', dir=directory)
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as file:
-                json.dump({'version': 1, 'mode': mode, 'orders_enabled': False}, file)
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(tmp, directory / 'execution-mode.json')
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
+        _write_state(directory, {'version': 1, 'mode': mode, 'orders_enabled': False, 'openings_enabled': False})
     return mode
+
+
+def set_demo_orders_enabled(enabled: bool, *, confirmed: bool = False) -> None:
+    """Set shared demo permission; changing mode and server start revoke it."""
+    if type(enabled) is not bool or (enabled and confirmed is not True):
+        raise ValueError('Explicit demo order confirmation required')
+    with _locked() as directory:
+        state = _read_state(directory)
+        if enabled and state['mode'] != 'demo':
+            raise ValueError('Demo mode required')
+        state['orders_enabled'] = enabled
+        state['openings_enabled'] = enabled
+        _write_state(directory, state)
+
+
+def set_demo_openings_enabled(enabled: bool, *, confirmed: bool = False) -> None:
+    if type(enabled) is not bool or (enabled and confirmed is not True):
+        raise ValueError('Explicit confirmation required')
+    with _locked() as directory:
+        state = _read_state(directory)
+        if enabled and (state['mode'] != 'demo' or not state['orders_enabled']):
+            raise ValueError('Demo order permission required')
+        state['openings_enabled'] = enabled
+        _write_state(directory, state)
+
+
+def current_state() -> dict:
+    with _locked() as directory:
+        return _read_state(directory)
 
 
 def forbid_orders() -> None:

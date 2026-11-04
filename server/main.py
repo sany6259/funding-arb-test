@@ -146,6 +146,9 @@ async def _background_scanner_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print(f"[funding-arb server] scripts dir: {_SCRIPTS_DIR}")
+    # Restart never inherits permission to submit demo orders.
+    from core.execution_mode import set_demo_orders_enabled
+    set_demo_orders_enabled(False)
     # Load exchange credentials (keyring / age / json) into os.environ so
     # settings endpoints and live executors see them.
     try:

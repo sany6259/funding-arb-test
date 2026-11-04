@@ -90,7 +90,32 @@ def _open_positions() -> list[dict[str, Any]]:
     return [p for p in load_pure_futures_positions() if p.get("status") == "open"]
 
 
+def _run_demo_once(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Use the pure-futures signal and isolated sequential demo executor."""
+    from execution import demo_futures, demo_futures_data
+    from execution.demo_futures_preflight import TechnicalLimits
+
+    pfa = cfg.get('pureFuturesArbitrage')
+    if not isinstance(pfa, dict) or cfg.get('dry_run') is not False:
+        raise demo_futures.DemoBlocked('Explicit demo strategy settings required')
+    base = pfa.get('demoBase')
+    notional = pfa.get('tradeUsdPerPair')
+    if not isinstance(base, str) or not isinstance(notional, (str, int, float)) or isinstance(notional, bool):
+        raise demo_futures.DemoBlocked('Demo base and position size are required')
+    limits = TechnicalLimits(30_000)
+    signal = demo_futures_data.pure_futures_signal(base.upper(), max_age_ms=limits.max_snapshot_age_ms)
+    pair = demo_futures_data.pair_for_notional(signal['base'], signal['long_venue'], signal['short_venue'],
+                                               str(notional), max_age_ms=limits.max_snapshot_age_ms)
+    result = demo_futures.execute_pair(pair, confirmed=True, risk_limits=limits)
+    return {'strategy': 'pure_futures_spread', 'mode': 'demo', 'signal': signal,
+            'actions': [{'action': 'open', 'result': result}],
+            'open_positions': 1 if result.get('state') == 'open_confirmed' else 0}
+
+
 def run_once(cfg: dict[str, Any], *, verbose: bool = False) -> dict[str, Any]:
+    from core import execution_mode
+    if execution_mode.current_mode() == 'demo':
+        return _run_demo_once(cfg)
     cfg = apply_strategy_to_pure_futures_cfg(cfg)
     strat = load_strategy_config()
     pfa = cfg.get("pureFuturesArbitrage") or {}
@@ -232,7 +257,7 @@ def main() -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
-    cfg = apply_strategy_to_pure_futures_cfg(_load_json(args.config))
+    cfg = _load_json(args.config)
     if not args.once and not args.watch:
         args.once = True
 
