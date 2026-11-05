@@ -25,6 +25,14 @@ jobs:
       # Windows) stays green on both platforms.
       - run: pip install -r server/requirements.txt requests pytest
       - run: python -m pytest scripts/tests/ -q
+        env:
+          PYTHONPATH: scripts/tests/offline_guard
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+          NO_PROXY: 127.0.0.1,localhost
+          http_proxy: http://127.0.0.1:9
+          https_proxy: http://127.0.0.1:9
+          no_proxy: 127.0.0.1,localhost
 
   install-smoke:
     runs-on: ubuntu-24.04
