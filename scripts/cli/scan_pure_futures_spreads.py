@@ -499,12 +499,13 @@ def scan_pure_futures_spreads(
     with_depth: bool = True,
     depth_top_n: int = DEFAULT_DEPTH_TOP_N,
     depth_window_pct: float = DEFAULT_DEPTH_WINDOW_PCT,
+    cache_ttl_sec: float = 30.0,
 ) -> dict[str, Any]:
     """Main entry point — scan and return structured results."""
     if venues is None:
         venues = ["binance", "bitget", "bybit", "okx"]
 
-    by_base = fetch_all_fee_rate_rows_by_base(venues, workers, cache_ttl_sec=30.0)
+    by_base = fetch_all_fee_rate_rows_by_base(venues, workers, cache_ttl_sec=cache_ttl_sec)
     _backfill_missing_settle_times(by_base, venues, workers)
     policy = parse_fee_policy(fee_policy)
     fee_cache = build_policy_futures_cache(by_base, policy, workers=workers)
@@ -531,6 +532,7 @@ def scan_pure_futures_spreads(
 
     return {
         "venues": venues,
+        "data_venues": sorted({venue for info in by_base.values() for venue in info}),
         "total_assets_scanned": len(by_base),
         "total_spreads_found": len(forward) + len(reverse),
         "forward": forward,

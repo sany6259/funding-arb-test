@@ -209,7 +209,7 @@ onUnmounted(() => {
             :loading="demoLoading ?? false"
           />
           <n-message-provider>
-            <DemoConnections v-if="!isDemoMode && executionMode === 'demo'" />
+            <DemoConnections v-if="!isDemoMode && executionMode === 'demo' && route.path === '/cex'" />
             <n-text v-else-if="!isDemoMode && executionMode === 'unavailable'" type="error">Не удалось проверить режим исполнения. Торговля недоступна.</n-text>
             <n-text v-else-if="route.path === '/dex' || route.path === '/cex'" type="warning">Настройка торговых ключей и кошельков отключена. Для проверки демо-ключей выберите режим «Демо».</n-text>
             <router-view v-else />

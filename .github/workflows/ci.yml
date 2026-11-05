@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, fix/vps-install-compatibility]
+    branches: [main, fix/vps-install-compatibility, feat/demo-futures-issue-17]
 
 jobs:
   test:
@@ -25,6 +25,11 @@ jobs:
       # Windows) stays green on both platforms.
       - run: pip install -r server/requirements.txt requests pytest
       - run: python -m pytest scripts/tests/ -q
+        env:
+          PYTHONPATH: scripts/tests/offline_guard
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+          NO_PROXY: 127.0.0.1,localhost
 
   install-smoke:
     runs-on: ubuntu-24.04
@@ -38,6 +43,8 @@ jobs:
           node-version: "22"
       - run: bash scripts/tests/smoke_install.sh
       - run: npm run test:i18n
+        working-directory: web
+      - run: npm run test:demo-navigation
         working-directory: web
       - run: test -z "$(git status --porcelain)"
 

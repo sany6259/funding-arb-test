@@ -8,7 +8,8 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test:i18n": "node --test scripts/test-i18n.mjs"
+    "test:i18n": "node --test scripts/test-i18n.mjs",
+    "test:demo-navigation": "node --test scripts/test-demo-navigation.mjs"
   },
   "dependencies": {
     "@nktkas/hyperliquid": "^0.32.2",

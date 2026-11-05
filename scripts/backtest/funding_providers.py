@@ -6,6 +6,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from core.execution_mode import LegacyAccessBlocked
 from venues.http_util import http_get_json
 
 _DEFAULT_INTERVAL_MS = 8 * 60 * 60 * 1000
@@ -42,6 +43,8 @@ def _http_get_with_retry(url: str, max_retries: int = 5) -> Any:
     for attempt in range(max_retries):
         try:
             return http_get_json(url, timeout=20, retries=1)
+        except LegacyAccessBlocked:
+            raise
         except Exception as e:
             last_err = e
             if attempt < max_retries - 1:

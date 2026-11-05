@@ -112,7 +112,7 @@ case "$MODE" in
         install_python_deps
         check_hyperliquid_repo
         info "Starting API server..."
-        exec "$PYTHON" -m uvicorn server.main:app --host 127.0.0.1 --port 8787
+        exec "$PYTHON" scripts/launch_backend.py --host 127.0.0.1 --port 8787
         ;;
 
     --build-web)
@@ -159,7 +159,7 @@ case "$MODE" in
 
         info "Starting server..."
         echo ""
-        exec "$PYTHON" server/main.py --no-reload
+        exec "$PYTHON" scripts/launch_backend.py --host 127.0.0.1 --port 8787
         ;;
 
     *)

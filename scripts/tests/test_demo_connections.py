@@ -369,14 +369,15 @@ def test_legacy_production_access_denied_before_network(monkeypatch):
     from server.routes import scanner
     execution_mode.set_mode('demo')
     monkeypatch.setattr(http_util._session, 'get', lambda *args, **kwargs: pytest.fail('network invoked'))
-    with pytest.raises(RuntimeError, match='Legacy API access disabled'):
-        http_util.http_get_json('https://api.bybit.com/v5/market/tickers')
+    with pytest.raises(RuntimeError, match='Demo market request'):
+        http_util.http_get_json('https://api.bybit.com/v5/order/create')
     for adapter, path in ((bybit, '/v5/account/info'), (okx, '/api/v5/account/balance'), (bitget, '/api/v2/spot/account/assets')):
         with pytest.raises(RuntimeError, match='Legacy API access disabled'):
             adapter._api_call('GET', path)
-    assert run(scanner.scanner_trigger(strategy='pure'))['success'] is False
+    # The demo scanner now uses a separately allowlisted public-market path;
+    # signed legacy APIs and order endpoints remain blocked.
     (execution_mode._directory() / 'execution-mode.json').write_text('{broken')
-    with pytest.raises(RuntimeError, match='Legacy API access disabled'):
+    with pytest.raises(RuntimeError, match='Execution mode unavailable'):
         http_util.http_get_json('https://api.bybit.com/v5/market/tickers')
 
 
