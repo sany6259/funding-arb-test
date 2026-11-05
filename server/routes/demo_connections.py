@@ -109,6 +109,7 @@ def _balance(venue: str, response: Any) -> str | None:
 
 
 def _check(venue: str, key: str, secret: str, passphrase: str) -> str | None:
+    shared_mode.require_network_enabled()
     base, path = _ENDPOINTS[venue]
     ts_ms = str(int(time.time() * 1000))
     if venue == "bybit":
@@ -126,11 +127,15 @@ def _check(venue: str, key: str, secret: str, passphrase: str) -> str | None:
             headers = {"ACCESS-KEY": key, "ACCESS-SIGN": sig, "ACCESS-TIMESTAMP": ts,
                        "ACCESS-PASSPHRASE": passphrase, "paptrading": "1"}
     req = urllib.request.Request(base + path, method="GET", headers=headers)
-    with urllib.request.build_opener(_NoRedirect()).open(req, timeout=10) as response:
-        data = response.read(1024 * 1024 + 1)
-        if len(data) > 1024 * 1024:
-            raise ValueError("Response too large")
-        return _balance(venue, json.loads(data))
+    with shared_mode._locked() as directory:
+        if shared_mode._read(directory) != 'demo':
+            raise RuntimeError('Demo mode required')
+        shared_mode.require_network_enabled()
+        with urllib.request.build_opener(_NoRedirect()).open(req, timeout=10) as response:
+            data = response.read(1024 * 1024 + 1)
+            if len(data) > 1024 * 1024:
+                raise ValueError("Response too large")
+            return _balance(venue, json.loads(data))
 
 
 def _is_loopback(host: str | None) -> bool:

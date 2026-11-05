@@ -96,10 +96,12 @@ def send_notification(
             url, data=payload, headers={"Content-Type": "application/json"}
         )
         try:
+            from core.execution_mode import require_network_enabled
+            require_network_enabled()
             with urllib.request.urlopen(req, timeout=5) as response:
                 success = response.status == 200
-        except Exception as e:
-            print(f"[Notify] Failed to send Telegram message: {e}", file=sys.stderr)
+        except Exception:
+            print("[Notify] Telegram message not sent", file=sys.stderr)
             success = False
 
         # Update cache on success

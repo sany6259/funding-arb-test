@@ -63,6 +63,7 @@ _unified_results: list[dict[str, Any]] = []
 _unified_ts: float = 0.0
 # Per-strategy locks so a slow carry/unified scan never blocks pure (and vice versa)
 _scanning_strategies: set[str] = set()
+_result_modes: dict[str, str] = {}
 
 # ---------------------------------------------------------------------------
 # Strategy config helpers (thresholds + venues from Settings)
@@ -117,13 +118,17 @@ def _scan_thresholds() -> tuple[float, float, float]:
     )
 
 
-def _fee_policy() -> dict[str, Any]:
+def _fee_policy(*, public_only: bool = False) -> dict[str, Any]:
     try:
         from core.fee_providers import parse_fee_policy  # noqa: E402
+        from core.execution_mode import current_mode
 
-        return parse_fee_policy(_strategy_cfg())
+        policy = parse_fee_policy(_strategy_cfg())
+        if public_only or current_mode() == 'demo':
+            policy['mode'] = 'vip_tier'  # Do not query private account fees.
+        return policy
     except Exception:
-        return {"mode": "auto", "venue_tiers": {}}
+        return {"mode": "vip_tier" if public_only else "auto", "venue_tiers": {}}
 
 
 def _min_edge_1h() -> float | None:
@@ -392,6 +397,14 @@ def _scanner_available(strategy: str) -> bool:
     return False
 
 
+def _cache_matches_mode(strategy: str) -> bool:
+    from core.execution_mode import current_mode
+    try:
+        return current_mode() == _result_modes.get(strategy, 'simulation')
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Routes: Pure Futures Spread
 # ---------------------------------------------------------------------------
@@ -420,6 +433,8 @@ async def scanner_status(
         has_data = len(_unified_results) > 0
         last_ts = _unified_ts
 
+    if not _cache_matches_mode(strategy):
+        has_data, last_ts = False, 0.0
     ts = (
         datetime.fromtimestamp(last_ts, tz=timezone.utc).isoformat()
         if last_ts
@@ -445,9 +460,19 @@ async def scanner_opportunities(
 ):
     """Return latest cached scan results (empty until a real scan completes)."""
     available = _scanner_available(strategy)
+    if not _cache_matches_mode(strategy):
+        return {"success": True, "data": _empty_pure() if strategy == 'pure' else [],
+                "live": available, "has_data": False}
     req_venues = (
         [v.strip().lower() for v in venues.split(",") if v.strip()] if venues else None
     )
+    if req_venues is not None:
+        from core.execution_mode import current_mode
+        try:
+            if current_mode() == 'demo':
+                req_venues = [v for v in req_venues if v in ('bybit', 'okx')] or ['bybit', 'okx']
+        except Exception:
+            return {"success": False, "error": "Режим исполнения недоступен."}
 
     if strategy == "pure":
         if _pure_results is not None:
@@ -521,11 +546,14 @@ async def scanner_trigger(
         _unified_results, \
         _unified_ts
 
-    from core.execution_mode import require_simulation_api
+    from core.execution_mode import current_mode, require_network_enabled
     try:
-        require_simulation_api()
-    except RuntimeError:
-        return {"success": False, "error": "Сканер недоступен в демо или при неизвестном режиме."}
+        mode = current_mode()
+        require_network_enabled()
+        if mode not in ('simulation', 'demo'):
+            raise RuntimeError('unknown mode')
+    except Exception:
+        return {"success": False, "error": "Сканер недоступен при неизвестном режиме или FARB_DRY_RUN."}
 
     # When called directly from Python (background loop / scan-all) instead of
     # via HTTP, unsupplied params arrive as FastAPI Query objects — normalize.
@@ -550,11 +578,12 @@ async def scanner_trigger(
                     "error": "Pure futures scanner unavailable",
                     "live": False,
                 }
+            allowed = ('bybit', 'okx') if mode == 'demo' else PURE_ALL_VENUES
             venue_list = [
                 v
                 for v in _parse_venue_list(venues, PURE_DEFAULT_VENUES)
-                if v in PURE_ALL_VENUES
-            ] or list(PURE_DEFAULT_VENUES)
+                if v in allowed
+            ] or (['bybit', 'okx'] if mode == 'demo' else list(PURE_DEFAULT_VENUES))
             edge_1h = _min_edge_1h()
             edge_mismatch = _min_edge_mismatch()
             scan_min_edge = (
@@ -562,18 +591,27 @@ async def scanner_trigger(
             )
 
             def _run_pure() -> dict[str, Any]:
+                demo_options = {'cache_ttl_sec': 0.0, 'with_depth': False} if mode == 'demo' else {}
                 raw = _scan_pure_fn(
                     venues=venue_list,
                     min_spread=min_spread,
                     min_edge=scan_min_edge,
                     max_mark_spread_pct=max_mark,
-                    fee_policy=_fee_policy(),
+                    fee_policy=_fee_policy(public_only=mode == 'demo'),
+                    **demo_options,
                 )
                 return _apply_group_thresholds(raw, min_edge, edge_1h, edge_mismatch)
 
             result = await loop.run_in_executor(None, _run_pure)
+            if current_mode() != mode:
+                return {"success": False, "error": "Режим изменился во время сканирования."}
+            if mode == 'demo':
+                if not set(venue_list).issubset(set(result.get('data_venues', []))):
+                    return {"success": False, "error": "Рыночные демоданные одной или нескольких бирж недоступны."}
+                result['market_environment'] = 'demo'
             _pure_results = result
             _pure_ts = time.time()
+            _result_modes['pure'] = mode
             await _broadcast("scanner.update", result)
             return {"success": True, "data": result, "live": True}
 
@@ -583,11 +621,12 @@ async def scanner_trigger(
 
             # Scan each venue in parallel via thread pool
             # Carry needs spot + borrow — drop perp-only venues (HL/aster/lighter)
+            allowed = ('bybit', 'okx') if mode == 'demo' else CARRY_VENUES
             carry_venues = [
                 v
                 for v in _parse_venue_list(venues, CARRY_VENUES)
-                if v in CARRY_VENUES
-            ] or list(CARRY_VENUES)
+                if v in allowed
+            ] or (['bybit', 'okx'] if mode == 'demo' else list(CARRY_VENUES))
 
             def _scan_one_carry(v: str) -> dict[str, Any]:
                 try:
@@ -597,7 +636,7 @@ async def scanner_trigger(
                         exit_rate=min_edge,
                         universe_min=min_edge,
                         max_workers=8,
-                        fee_policy=_fee_policy(),
+                        fee_policy=_fee_policy(public_only=mode == 'demo'),
                     )
                     # Simplify: keep only forward/reverse candidates + metadata
                     return {
@@ -612,7 +651,8 @@ async def scanner_trigger(
                         "fee_tier": r.get("fee_tier"),
                     }
                 except Exception as e:
-                    return {"venue": v, "error": str(e), "forward": [], "reverse": []}
+                    return {"venue": v, "error": "Демоданные недоступны" if mode == 'demo' else str(e),
+                            "forward": [], "reverse": []}
 
             def _scan_all_carry() -> list[dict[str, Any]]:
                 # Venues scan concurrently — each one already parallelizes its own IO
@@ -622,8 +662,13 @@ async def scanner_trigger(
                     return list(pool.map(_scan_one_carry, carry_venues))
 
             result = await loop.run_in_executor(None, _scan_all_carry)
+            if current_mode() != mode:
+                return {"success": False, "error": "Режим изменился во время сканирования."}
+            if mode == 'demo' and not any(not item.get('error') for item in result):
+                return {"success": False, "error": "Рыночные демоданные бирж недоступны."}
             _carry_results = result
             _carry_ts = time.time()
+            _result_modes['carry'] = mode
             await _broadcast("scanner.update", {"strategy": "carry", "data": result})
             return {"success": True, "data": result, "live": True}
 
@@ -631,17 +676,20 @@ async def scanner_trigger(
             if _unified_carry_cls is None:
                 return {"success": False, "error": "Unified carry scanner unavailable"}
 
+            allowed = ('bybit', 'okx') if mode == 'demo' else CARRY_VENUES
             unified_venues = [
                 v
                 for v in _parse_venue_list(venues, list(DEFAULT_VENUES))
-                if v in CARRY_VENUES
-            ] or list(DEFAULT_VENUES)
+                if v in allowed
+            ] or (['bybit', 'okx'] if mode == 'demo' else list(DEFAULT_VENUES))
 
             def _scan_unified() -> list[dict[str, Any]]:
                 pool = _unified_carry_cls(
-                    venues=unified_venues, fee_policy=_fee_policy()
+                    venues=unified_venues, fee_policy=_fee_policy(public_only=mode == 'demo')
                 )
                 pool.refresh()
+                if mode == 'demo' and not pool.legs_by_base:
+                    raise RuntimeError('demo market data unavailable')
                 # scan_routes returns {"forward": [...], "reverse": [...]}, not base→routes
                 grouped = pool.scan_routes(
                     entry=min_spread, universe_min=min_edge
@@ -672,13 +720,16 @@ async def scanner_trigger(
                 return result[:100]
 
             result = await loop.run_in_executor(None, _scan_unified)
+            if current_mode() != mode:
+                return {"success": False, "error": "Режим изменился во время сканирования."}
             _unified_results = result
             _unified_ts = time.time()
+            _result_modes['unified'] = mode
             await _broadcast("scanner.update", {"strategy": "unified", "data": result})
             return {"success": True, "data": result, "live": True}
 
     except Exception as e:
-        return {"success": False, "error": f"Scan failed: {e}"}
+        return {"success": False, "error": "Демосканирование недоступно." if mode == 'demo' else f"Scan failed: {e}"}
     finally:
         _scanning_strategies.discard(strategy)
 
@@ -686,6 +737,12 @@ async def scanner_trigger(
 @router.post("/scanner/scan-all")
 async def scanner_scan_all():
     """Trigger all scanner types and return combined results."""
+    from core.execution_mode import current_mode, require_network_enabled
+    try:
+        current_mode()
+        require_network_enabled()
+    except Exception:
+        return {"success": False, "error": "Сканер недоступен при неизвестном режиме или FARB_DRY_RUN."}
     results: dict[str, Any] = {}
 
     # Pure futures (existing)
@@ -722,18 +779,18 @@ async def scanner_recalc_fees():
     edge_mismatch = _min_edge_mismatch()
     updated: dict[str, Any] = {}
 
-    if _pure_results is not None:
+    if _pure_results is not None and _cache_matches_mode('pure'):
         recalc = _recalc_pure_fees(_pure_results)
         _pure_results = _apply_group_thresholds(
             recalc, min_edge, edge_1h, edge_mismatch
         )
         updated["pure"] = _pure_results
 
-    if _carry_results:
+    if _carry_results and _cache_matches_mode('carry'):
         _carry_results = _recalc_carry_fees(_carry_results)
         updated["carry"] = _carry_results
 
-    if _unified_results:
+    if _unified_results and _cache_matches_mode('unified'):
         _unified_results = _recalc_unified_fees(_unified_results)
         updated["unified"] = _unified_results
 

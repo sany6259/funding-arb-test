@@ -134,10 +134,16 @@ def require_simulation_api() -> None:
     """Legacy production/public routes are unavailable outside simulation."""
     try:
         if current_mode() == 'simulation':
+            require_network_enabled()
             return
     except Exception:
         pass
     raise LegacyAccessBlocked('Legacy API access disabled in demo or unknown mode') from None
+
+
+def require_network_enabled() -> None:
+    if os.environ.get('FARB_DRY_RUN', '').strip().lower() not in ('', '0', 'false', 'no', 'off'):
+        raise LegacyAccessBlocked('Network disabled by FARB_DRY_RUN')
 
 
 def simulation_request(call, *args, **kwargs):
@@ -153,4 +159,5 @@ def simulation_request(call, *args, **kwargs):
             raise LegacyAccessBlocked('Legacy API access disabled in demo or unknown mode') from None
         if mode != 'simulation':
             raise LegacyAccessBlocked('Legacy API access disabled in demo or unknown mode')
+        require_network_enabled()
         return call(*args, **kwargs)

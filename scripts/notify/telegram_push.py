@@ -400,6 +400,8 @@ def send_telegram_message(
     is attached only when given — most chunks of a multi-message digest
     don't need one.
     """
+    from core.execution_mode import require_network_enabled
+    require_network_enabled()
     token = config["telegram_bot_token"]
     chat_id = config["telegram_chat_id"]
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -421,10 +423,9 @@ def send_telegram_message(
         with urllib.request.urlopen(req, timeout=timeout) as response:
             return response.status == 200
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:300]
-        raise RuntimeError(f"Telegram HTTP {e.code}: {body}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Telegram network error: {e.reason}") from e
+        raise RuntimeError(f"Telegram HTTP {e.code}") from None
+    except urllib.error.URLError:
+        raise RuntimeError("Telegram network error") from None
 
 
 def broadcast(

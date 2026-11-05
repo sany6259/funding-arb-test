@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, fix/vps-install-compatibility]
+    branches: [main, fix/vps-install-compatibility, feat/demo-futures-issue-17]
 
 jobs:
   test:
@@ -38,6 +38,8 @@ jobs:
           node-version: "22"
       - run: bash scripts/tests/smoke_install.sh
       - run: npm run test:i18n
+        working-directory: web
+      - run: npm run test:demo-navigation
         working-directory: web
       - run: test -z "$(git status --porcelain)"
 
