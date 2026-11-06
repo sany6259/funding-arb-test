@@ -33,6 +33,7 @@ import { useWebSocket } from '@/composables/useApi'
 import { isDemoMode, useDemoSnapshot } from '@/composables/useDemoSnapshot'
 import DemoBanner from '@/components/DemoBanner.vue'
 import DemoConnections from '@/components/DemoConnections.vue'
+import DemoTrading from '@/components/DemoTrading.vue'
 import { executionMode, executionModeBusy, refreshExecutionMode, setExecutionMode } from '@/composables/useExecutionMode'
 import i18n, { setLocale, SUPPORTED_LOCALES, type SupportedLocale } from '@/i18n'
 
@@ -181,7 +182,7 @@ onUnmounted(() => {
               :disabled="isDemoMode || executionModeBusy || executionMode === 'unavailable'"
               :options="[
                 { label: 'Симуляция', value: 'simulation' },
-                { label: 'Демо (только проверка)', value: 'demo' },
+                { label: 'Демо', value: 'demo' },
                 { label: 'Реальная торговля (недоступна)', value: 'live', disabled: true },
                 { label: 'Режим недоступен', value: 'unavailable', disabled: true },
               ]"
@@ -210,6 +211,7 @@ onUnmounted(() => {
           />
           <n-message-provider>
             <DemoConnections v-if="!isDemoMode && executionMode === 'demo' && route.path === '/cex'" />
+            <DemoTrading v-else-if="!isDemoMode && executionMode === 'demo' && route.path === '/positions'" />
             <n-text v-else-if="!isDemoMode && executionMode === 'unavailable'" type="error">Не удалось проверить режим исполнения. Торговля недоступна.</n-text>
             <n-text v-else-if="route.path === '/dex' || route.path === '/cex'" type="warning">Настройка торговых ключей и кошельков отключена. Для проверки демо-ключей выберите режим «Демо».</n-text>
             <router-view v-else />

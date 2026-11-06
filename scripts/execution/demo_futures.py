@@ -72,8 +72,9 @@ def _number(value: Any) -> Decimal:
     return result
 
 
-def _permit(confirmed: bool, *, directory: Path | None = None, opening: bool = False) -> None:
-    if confirmed is not True:
+def _permit(confirmed: bool, *, directory: Path | None = None, opening: bool = False,
+            read_only: bool = False) -> None:
+    if confirmed is not True and not read_only:
         raise DemoBlocked('Explicit demo order permission is required')
     if os.environ.get('FARB_DRY_RUN', '').strip().lower() not in ('', '0', 'false', 'no', 'off'):
         raise DemoBlocked('Dry-run mode forbids demo orders')
@@ -91,7 +92,7 @@ def _permit(confirmed: bool, *, directory: Path | None = None, opening: bool = F
             state = execution_mode._read_state(directory)
         if state['mode'] != 'demo':
             raise DemoBlocked('Demo mode is required')
-        if state['orders_enabled'] is not True:
+        if not read_only and state['orders_enabled'] is not True:
             raise DemoBlocked('Explicit demo order permission is required')
         if opening and state['openings_enabled'] is not True:
             raise DemoBlocked('New demo openings are disabled')

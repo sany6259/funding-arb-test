@@ -1274,3 +1274,106 @@ def test_manual_resolution_rejects_conflicting_terminal_statuses(exchange):
     with pytest.raises(data.DemoDataBlocked):
         data.verify_terminal_order('bybit', 'BTC', journal_record(1)['legs'][0]['request'], max_age_ms=10_000)
     assert calls and all(req.method == 'GET' for req in calls)
+
+
+def test_issue22_read_only_positions_without_order_permission(exchange, monkeypatch):
+    """Demo reads do not require order permission, but still enforce mode and dry-run."""
+    responses, calls = exchange
+    execution_mode.set_demo_orders_enabled(False)
+    assert data.read('bybit', 'BTC', 'position').payload == responses[('bybit', '/v5/position/list')]
+    assert data.read('okx', 'BTC', 'position').payload == responses[('okx', '/api/v5/account/positions')]
+    assert all(request.method == 'GET' for request in calls)
+    with pytest.raises(demo.DemoBlocked):
+        demo.execute_pair(pair(), confirmed=True, risk_limits=limits())
+    monkeypatch.setenv('FARB_DRY_RUN', '1')
+    with pytest.raises(data.DemoDataBlocked):
+        data.read('bybit', 'BTC', 'position')
+    monkeypatch.delenv('FARB_DRY_RUN')
+    execution_mode.set_mode('simulation')
+    with pytest.raises(data.DemoDataBlocked):
+        data.read('okx', 'BTC', 'position')
+
+
+def test_issue22_web_manual_pair_full_cycle_on_mock_transport(exchange, monkeypatch):
+    """Exercise web controls through real permission, preflight, journal and adapters."""
+    import asyncio
+    from types import SimpleNamespace
+    from server.routes import demo_trading
+
+    class Request:
+        def __init__(self, payload, host='127.0.0.1'):
+            self.payload = payload
+            self.client = SimpleNamespace(host=host)
+            self.url = SimpleNamespace(hostname='127.0.0.1')
+            self.headers = {'content-type': 'application/json'}
+        async def json(self):
+            return self.payload
+
+    async def immediate(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+    monkeypatch.setattr(demo_trading.asyncio, 'to_thread', immediate)
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    execution_mode.set_demo_orders_enabled(False)
+    async def run():
+        assert (await demo_trading.positions(Request({'base': 'BTC'})))['result']['okx']['positions'] == []
+        payload = {'base': 'BTC', 'long_venue': 'bybit', 'short_venue': 'okx', 'amount_usd': '2000', 'confirmed': True}
+        assert (await demo_trading.open_pair(Request(payload))).status_code == 409
+        assert (await demo_trading.permission(Request({'enabled': True, 'confirmed': True}, host='192.0.2.1'))).status_code == 403
+        assert (await demo_trading.permission(Request({'enabled': True, 'confirmed': True})))['orders_enabled']
+        result = await demo_trading.open_pair(Request(payload))
+        assert result['result']['state'] == 'open_confirmed'
+        summary = (await demo_trading.journal(Request({})))['result']
+        assert summary['state'] == 'open_confirmed' and len(summary['legs']) == 2
+        assert all(leg['confirmed'] for leg in summary['legs'])
+        result = await demo_trading.positions(Request({'base': 'BTC'}))
+        assert result['result']['bybit']['positions'][0]['size'] != '0'
+        assert result['result']['okx']['positions'][0]['pos'] != '0'
+        assert not (await demo_trading.stop_openings(Request({'confirmed': True})))['openings_enabled']
+        assert (await demo_trading.open_pair(Request(payload))).status_code == 409
+        assert (await demo_trading.close_pair(Request({'confirmed': True})))['result']['state'] == 'closed_confirmed'
+        assert (await demo_trading.permission(Request({'enabled': False, 'confirmed': True})))['orders_enabled'] is False
+    asyncio.run(run())
+    posted = [(urlsplit(req.full_url).hostname, json.loads(req.data)) for req in fake.calls if req.method == 'POST']
+    assert [host for host, _ in posted] == ['api-demo.bybit.com', 'www.okx.com', 'www.okx.com', 'api-demo.bybit.com']
+    assert all(fields['reduceOnly'] is True for _, fields in posted[2:])
+    assert all(req.get_header('X-simulated-trading') == '1' for req in fake.calls if urlsplit(req.full_url).hostname == 'www.okx.com')
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'partial', 'rejected'])
+def test_issue22_web_uncertain_order_blocks_repeat(exchange, monkeypatch, failure):
+    import asyncio
+    from types import SimpleNamespace
+    from server.routes import demo_trading
+
+    class Request:
+        def __init__(self, payload):
+            self.payload = payload
+            self.client = SimpleNamespace(host='127.0.0.1')
+            self.url = SimpleNamespace(hostname='127.0.0.1')
+            self.headers = {'content-type': 'application/json'}
+        async def json(self):
+            return self.payload
+
+    async def immediate(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+    monkeypatch.setattr(demo_trading.asyncio, 'to_thread', immediate)
+    fake = LifecycleExchange(exchange[0])
+    if failure == 'timeout':
+        fake.fail_post = 'bybit'
+    elif failure == 'partial':
+        fake.partial = 'bybit'
+    else:
+        fake.reject_post = 'bybit'
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    payload = {'base': 'BTC', 'long_venue': 'bybit', 'short_venue': 'okx', 'amount_usd': '2000', 'confirmed': True}
+    async def run():
+        result = await demo_trading.open_pair(Request(payload))
+        assert result['result']['state'] == 'reconciliation_required'
+        journal = (await demo_trading.journal(Request({})))['result']
+        assert journal['state'] == 'reconciliation_required'
+        assert journal['legs'][0]['client_id']
+        assert (await demo_trading.open_pair(Request(payload))).status_code == 409
+    asyncio.run(run())
+    assert len([request for request in fake.calls if request.method == 'POST']) == 1

@@ -98,7 +98,7 @@ def read(venue: str, base: str, resource: str, *, cursor: str | None = None,
         raise DemoDataBlocked('Invalid pagination cursor')
     try:
         started_ms = int(time.time() * 1000)
-        demo._permit(True)
+        demo._permit(False, read_only=True)
         creds = demo._demo_creds(venue)
         path, params = routes[resource]
         params = dict(params)
@@ -122,7 +122,7 @@ def read(venue: str, base: str, resource: str, *, cursor: str | None = None,
                        'x-simulated-trading': '1'}
         request = urllib.request.Request(demo._demo_base(venue) + target, method='GET', headers=headers)
         with execution_mode._locked() as directory:
-            demo._permit(True, directory=directory)
+            demo._permit(False, directory=directory, read_only=True)
             if execution_mode._read(directory) != 'demo':
                 raise DemoDataBlocked('Demo mode required')
             with urllib.request.build_opener(demo._NoRedirect()).open(request, timeout=10) as response:
