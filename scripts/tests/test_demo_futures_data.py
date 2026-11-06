@@ -1849,3 +1849,34 @@ def test_issue22_cancel_existing_demo_order_once_then_reconcile(exchange, monkey
     demo._permit(True)
     posts = [req for req in fake.calls if req.method == 'POST']
     assert len(posts) == 1 and urlsplit(posts[0].full_url).path == '/v5/order/cancel'
+
+
+def test_issue22_cancel_existing_okx_order_stays_in_demo(exchange, monkeypatch):
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    responses[('okx', '/api/v5/trade/orders-pending')] = okx([{'instId': 'BTC-USDT-SWAP', 'ordId': '99',
+        'clOrdId': 'client987', 'side': 'sell', 'sz': '1', 'state': 'live'}])
+    original_open = fake.open
+    terminal = False
+    def transport(request, timeout):
+        query = parse_qs(urlsplit(request.full_url).query)
+        if request.method == 'GET' and 'clOrdId' in query:
+            payload = okx([{'instId': 'BTC-USDT-SWAP', 'ordId': '99', 'clOrdId': 'client987',
+                            'side': 'sell', 'state': 'canceled' if terminal else 'live', 'accFillSz': '0', 'avgPx': ''}])
+            class Response:
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+                def read(self, limit): return json.dumps(payload).encode()
+            fake.calls.append(request)
+            return Response()
+        return original_open(request, timeout)
+    fake.open = transport
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    assert demo.cancel_open_order('okx', 'BTC', 'client987', confirmed=True)['state'] == 'cancel_reconciliation_required'
+    terminal = True
+    responses[('okx', '/api/v5/trade/orders-pending')] = okx([])
+    assert demo.reconcile_external_cancel(confirmed=True)['state'] == 'cancel_resolved'
+    posts = [req for req in fake.calls if req.method == 'POST']
+    assert len(posts) == 1 and urlsplit(posts[0].full_url).hostname == 'www.okx.com'
+    assert urlsplit(posts[0].full_url).path == '/api/v5/trade/cancel-order'
+    assert posts[0].get_header('X-simulated-trading') == '1'
