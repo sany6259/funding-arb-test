@@ -50,7 +50,7 @@ async function action(venue: Venue, operation: 'save' | 'delete' | 'check') {
     if (data.environment !== 'demo' || data.venue !== venue) throw new Error('invalid')
     if (operation === 'check') {
       const spec = venues.find(v => v.id === venue)!
-      if (data.connected !== true || data.orders_enabled !== false || data.credentials !== '••••' ||
+      if (data.connected !== true || typeof data.orders_enabled !== 'boolean' || data.credentials !== '••••' ||
           data.balance?.asset !== spec.asset || data.balance.account_type !== spec.account ||
           (data.balance.amount !== null && typeof data.balance.amount !== 'string')) throw new Error('invalid')
       statuses[venue] = data.balance.amount === null
@@ -76,8 +76,8 @@ async function action(venue: Venue, operation: 'save' | 'delete' | 'check') {
   <div class="demo-connections">
     <n-alert v-if="!localAccess" type="error">Доступ к ключам разрешён только через локальный адрес или SSH-туннель.</n-alert>
     <n-alert v-if="storeError" type="error">{{ storeError }}</n-alert>
-    <n-alert type="warning" title="Демо: только проверка подключения">
-      Используйте отдельные демоключи без права вывода. Они сохраняются в защищённом хранилище. Ордера отключены; проверка баланса не подтверждает готовность к торговле.
+    <n-alert type="warning" title="Демо-счета">
+      Используйте отдельные демоключи без права вывода. Они сохраняются в защищённом хранилище. Проверка баланса не подтверждает готовность к торговле.
     </n-alert>
     <n-card v-for="venue in venues" :key="venue.id" :title="venue.name" size="small">
       <n-space vertical>

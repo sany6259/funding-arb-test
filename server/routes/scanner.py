@@ -118,6 +118,46 @@ def _scan_thresholds() -> tuple[float, float, float]:
     )
 
 
+def _enrich_demo_costs(result: dict[str, Any], min_edge: float, edge_1h: float | None,
+                       edge_mismatch: float | None) -> dict[str, Any]:
+    """Retain only demo signals backed by current account fees and book depth."""
+    from decimal import Decimal
+    from execution import demo_futures_data
+    notional = str(_strategy_cfg().get('trade_usd', ''))
+    candidates = [(kind, row) for kind in ('forward', 'reverse') for row in result.get(kind, [])]
+    candidates.sort(key=lambda item: -float(item[1].get('real_edge_pct', 0)))
+    verified = {'forward': [], 'reverse': []}
+    failed = 0
+    for kind, original in candidates[:10]:
+        try:
+            row = dict(original)
+            pair = demo_futures_data.pair_for_notional(row['base'], row['long_venue'], row['short_venue'],
+                                                       notional, max_age_ms=30_000)
+            costs = demo_futures_data.demo_pair_costs(pair, max_age_ms=30_000)
+            long, short = costs[pair.long_venue], costs[pair.short_venue]
+            fee = Decimal(long['fee_rate']) + Decimal(short['fee_rate'])
+            slip = Decimal(long['slippage_rate']) + Decimal(short['slippage_rate'])
+            marks = [Decimal(long['mark_price']), Decimal(short['mark_price'])]
+            mark_pct = abs(marks[0] - marks[1]) / max(marks) * 100
+            gross = Decimal(str(row['spread_pct']))
+            net = gross - (fee + slip) * 2 * 100
+            row.update(long_fee_pct=float(Decimal(long['fee_rate']) * 100),
+                       short_fee_pct=float(Decimal(short['fee_rate']) * 100),
+                       fee_pct=float(fee * 100), round_trip_fee_pct=float(fee * 200),
+                       slippage_pct=float(slip * 200), net_edge_pct=float(net),
+                       mark_spread_pct=float(mark_pct), real_edge_pct=float(net - mark_pct),
+                       net_apy_pct=float(Decimal(str(row['annual_apy_pct'])) - (fee + slip) * 200 - mark_pct),
+                       fee_source='demo_account', demo_costs_verified=True)
+            verified[kind].append(row)
+        except Exception:
+            failed += 1
+    result['forward'], result['reverse'] = verified['forward'], verified['reverse']
+    result['demo_unverified_count'] = failed + max(0, len(candidates) - 10)
+    result['demo_fee_source'] = 'demo_account'
+    result['total_spreads_found'] = len(verified['forward']) + len(verified['reverse'])
+    return _apply_group_thresholds(result, min_edge, edge_1h, edge_mismatch)
+
+
 def _fee_policy(*, public_only: bool = False) -> dict[str, Any]:
     try:
         from core.fee_providers import parse_fee_policy  # noqa: E402
@@ -555,6 +595,9 @@ async def scanner_trigger(
     except Exception:
         return {"success": False, "error": "Сканер недоступен при неизвестном режиме или FARB_DRY_RUN."}
 
+    if mode == 'demo' and isinstance(strategy, str) and strategy != 'pure':
+        return {"success": False, "error": "В деморежиме доступен только фьючерсный сканер Bybit/OKX."}
+
     # When called directly from Python (background loop / scan-all) instead of
     # via HTTP, unsupplied params arrive as FastAPI Query objects — normalize.
     if not isinstance(strategy, str):
@@ -591,15 +634,17 @@ async def scanner_trigger(
             )
 
             def _run_pure() -> dict[str, Any]:
-                demo_options = {'cache_ttl_sec': 0.0, 'with_depth': False} if mode == 'demo' else {}
+                demo_options = {'cache_ttl_sec': 0.0, 'with_depth': True} if mode == 'demo' else {}
                 raw = _scan_pure_fn(
                     venues=venue_list,
                     min_spread=min_spread,
-                    min_edge=scan_min_edge,
+                    min_edge=-999.0 if mode == 'demo' else scan_min_edge,
                     max_mark_spread_pct=max_mark,
                     fee_policy=_fee_policy(public_only=mode == 'demo'),
                     **demo_options,
                 )
+                if mode == 'demo':
+                    return _enrich_demo_costs(raw, min_edge, edge_1h, edge_mismatch)
                 return _apply_group_thresholds(raw, min_edge, edge_1h, edge_mismatch)
 
             result = await loop.run_in_executor(None, _run_pure)

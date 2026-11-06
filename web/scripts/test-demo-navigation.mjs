@@ -28,12 +28,13 @@ test('demo navigation keeps positions and backtest separate from CEX credentials
   app.component('n-message-provider', wrapper)
   app.component('n-text', wrapper)
   app.component('DemoConnections', demoConnections)
+  app.component('DemoTrading', view('DEMO_TRADING'))
   app.use(router)
   for (const [path, expected, absent] of [
-    ['/positions', 'POSITIONS_VIEW', 'DEMO_CONNECTIONS'],
+    ['/positions', 'DEMO_TRADING', 'DEMO_CONNECTIONS'],
     ['/cex', 'DEMO_CONNECTIONS', 'CEX_VIEW'],
     ['/backtest', 'BACKTEST_VIEW', 'DEMO_CONNECTIONS'],
-    ['/positions', 'POSITIONS_VIEW', 'DEMO_CONNECTIONS'],
+    ['/positions', 'DEMO_TRADING', 'DEMO_CONNECTIONS'],
   ]) {
     await router.push(path)
     await router.isReady()

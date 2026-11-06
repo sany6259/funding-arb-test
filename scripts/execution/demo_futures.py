@@ -28,6 +28,9 @@ _PATHS = {'bybit': ('/v5/order/create', '/v5/order/realtime'),
           'okx': ('/api/v5/trade/order', '/api/v5/trade/order')}
 _CANCEL_PATHS = {'bybit': '/v5/order/cancel', 'okx': '/api/v5/trade/cancel-order'}
 _PAIR_ACTIVE: ContextVar[bool] = ContextVar('demo_futures_pair_active', default=False)
+_CANCELLED: ContextVar[Any] = ContextVar('demo_futures_cancelled', default=None)
+_STRATEGY_ACTIVE: ContextVar[bool] = ContextVar('demo_futures_strategy_active', default=False)
+_EXTERNAL_CANCEL_ACTIVE: ContextVar[bool] = ContextVar('demo_futures_external_cancel_active', default=False)
 
 
 class DemoBlocked(RuntimeError):
@@ -72,8 +75,15 @@ def _number(value: Any) -> Decimal:
     return result
 
 
-def _permit(confirmed: bool, *, directory: Path | None = None, opening: bool = False) -> None:
-    if confirmed is not True:
+def _permit(confirmed: bool, *, directory: Path | None = None, opening: bool = False,
+            read_only: bool = False) -> None:
+    cancelled = _CANCELLED.get()
+    if not read_only and cancelled is not None and cancelled():
+        raise DemoBlocked('Demo strategy was stopped')
+    cancel_path = execution_mode._directory() / 'demo-futures-cancel-intent.json'
+    if not read_only and not _EXTERNAL_CANCEL_ACTIVE.get() and (cancel_path.exists() or cancel_path.is_symlink()):
+        raise DemoBlocked('Demo cancellation requires reconciliation')
+    if confirmed is not True and not read_only:
         raise DemoBlocked('Explicit demo order permission is required')
     if os.environ.get('FARB_DRY_RUN', '').strip().lower() not in ('', '0', 'false', 'no', 'off'):
         raise DemoBlocked('Dry-run mode forbids demo orders')
@@ -91,9 +101,9 @@ def _permit(confirmed: bool, *, directory: Path | None = None, opening: bool = F
             state = execution_mode._read_state(directory)
         if state['mode'] != 'demo':
             raise DemoBlocked('Demo mode is required')
-        if state['orders_enabled'] is not True:
+        if not read_only and state['orders_enabled'] is not True:
             raise DemoBlocked('Explicit demo order permission is required')
-        if opening and state['openings_enabled'] is not True:
+        if (opening or _STRATEGY_ACTIVE.get()) and not read_only and state['openings_enabled'] is not True:
             raise DemoBlocked('New demo openings are disabled')
     except DemoBlocked:
         raise
@@ -389,11 +399,15 @@ def execute_pair(pair: FuturesPair, *, confirmed: bool = False, risk_limits=None
     try:
         if not lock_exclusive(fd, blocking=False):
             raise DemoBlocked('Another demo pair is in progress')
+        _permit(confirmed, opening=True)
         if path.exists() or path.is_symlink():
             if risk_limits is None:
                 raise DemoBlocked('Existing demo intent requires manual reconciliation')
             try:
-                _archive_confirmed_closed_pair(path, risk_limits)
+                try:
+                    _archive_confirmed_closed_pair(path, risk_limits)
+                except DemoBlocked:
+                    _archive_confirmed_closed_single(path, risk_limits.max_snapshot_age_ms)
             except DemoBlocked:
                 raise DemoBlocked('Existing demo intent requires manual reconciliation') from None
         if risk_limits is None:
@@ -751,6 +765,7 @@ def close_pair(*, confirmed: bool = False, close_confirmed: bool = False, risk_l
         locked = lock_exclusive(fd, blocking=False)
         if not locked:
             raise DemoBlocked('Another demo operation is in progress')
+        _permit(confirmed)
         pair, record = _read_open_journal_for_close(path)
         original_ids = {leg['request']['orderLinkId' if leg['venue'] == 'bybit' else 'clOrdId'] for leg in record['legs']}
         close_ids = (uuid.uuid4().hex[:24], uuid.uuid4().hex[:24])
@@ -820,6 +835,7 @@ def cancel_pending(venue: str, client_id: str, *, confirmed: bool = False) -> di
         locked = lock_exclusive(lock_fd, blocking=False)
         if not locked:
             raise DemoBlocked('Another demo operation is in progress')
+        _permit(confirmed)
         fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
         with os.fdopen(fd, 'rb') as file:
             info = os.fstat(file.fileno())
@@ -837,7 +853,7 @@ def cancel_pending(venue: str, client_id: str, *, confirmed: bool = False) -> di
         if state not in allowed:
             raise DemoBlocked('No cancellable uncertain order in journal')
         entries = record.get('closing') if state.startswith('close_') else record.get('legs')
-        if not isinstance(entries, list) or len(entries) != 2:
+        if not isinstance(entries, list) or len(entries) != (1 if record.get('kind') == 'single' else 2):
             raise DemoBlocked('Pending journal invalid')
         if state.startswith(('leg_1_', 'close_1_')):
             index = 0
@@ -845,7 +861,7 @@ def cancel_pending(venue: str, client_id: str, *, confirmed: bool = False) -> di
             index = 1
         else:
             index = record.get('uncertain_close' if state.startswith('close_') else 'uncertain_leg')
-            if type(index) is not int or index not in (0, 1):
+            if type(index) is not int or not 0 <= index < len(entries):
                 raise DemoBlocked('Uncertain order identity requires manual review')
         leg = entries[index]
         if not isinstance(leg, dict) or leg.get('venue') != venue or not isinstance(leg.get('request'), dict):
@@ -895,6 +911,7 @@ def resolve_pending_flat(*, confirmed: bool = False, max_age_ms: int = 30_000) -
         locked = lock_exclusive(lock_fd, blocking=False)
         if not locked:
             raise DemoBlocked('Another demo operation is in progress')
+        _permit(confirmed)
         fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
         with os.fdopen(fd, 'rb') as file:
             info = os.fstat(file.fileno())
@@ -985,3 +1002,847 @@ def resolve_pending_flat(*, confirmed: bool = False, max_age_ms: int = 30_000) -
         if locked:
             unlock(lock_fd)
         os.close(lock_fd)
+
+
+def _read_single_journal(path: Path, *, states: frozenset[str]) -> dict[str, Any]:
+    import stat
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        with os.fdopen(fd, 'rb') as file:
+            info = os.fstat(file.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_size > 1_048_576 or
+                    (os.name != 'nt' and (info.st_uid != os.geteuid() or info.st_mode & 0o077))):
+                raise ValueError('Invalid journal permissions')
+            record = json.loads(file.read(1_048_577))
+        if (not isinstance(record, dict) or type(record.get('version')) is not int or record.get('version') != 1 or record.get('kind') != 'single' or
+                record.get('state') not in states or not isinstance(record.get('id'), str) or
+                not re.fullmatch(r'[a-f0-9]{32}', record['id']) or not isinstance(record.get('base'), str) or
+                not re.fullmatch(r'[A-Z][A-Z0-9]{1,14}', record['base']) or
+                not isinstance(record.get('legs'), list) or len(record['legs']) != 1):
+            raise ValueError('Invalid journal')
+        leg = record['legs'][0]
+        venue, fields = leg['venue'], leg['request']
+        _validate_route(venue, 'POST', None, fields)
+        if fields.get('reduceOnly') is not None or fields['symbol' if venue == 'bybit' else 'instId'] != record['base'] + ('USDT' if venue == 'bybit' else '-USDT-SWAP'):
+            raise ValueError('Invalid opening')
+        amount_key = 'qty' if venue == 'bybit' else 'sz'
+        effective = _quantity(fields[amount_key])
+        state = record['state']
+        prior = record.get('cancellation', {}).get('previous_state') if state.startswith('cancel_') else state
+        has_open = state in ('open_confirmed', 'open_partial_confirmed', 'closed_confirmed') or (isinstance(prior, str) and prior.startswith('close_'))
+        if has_open:
+            recovered = leg.get('reconciled_fill')
+            confirmation = recovered if recovered is not None else leg.get('confirmation')
+            if (not isinstance(confirmation, dict) or confirmation.get('venue') != venue or
+                    confirmation.get('order_id') != leg.get('order_id') or
+                    not isinstance(leg.get('order_id'), str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', leg['order_id']) or
+                    _quantity(confirmation['avg_price']) <= 0):
+                raise ValueError('Opening not confirmed')
+            effective = _quantity(confirmation['filled_qty'])
+            if effective > _quantity(fields[amount_key]) or (recovered is None and effective != _quantity(fields[amount_key])):
+                raise ValueError('Opening quantity invalid')
+            if recovered is not None and recovered.get('state') not in ('Filled', 'Cancelled', 'Rejected', 'Deactivated', 'PartiallyFilledCanceled', 'filled', 'canceled'):
+                raise ValueError('Recovered order not terminal')
+            if recovered is not None and recovered.get('state') in ('Filled', 'filled') and effective != _quantity(fields[amount_key]):
+                raise ValueError('Full-fill proof mismatches order quantity')
+        symbol = 'symbol' if venue == 'bybit' else 'instId'
+        client = 'orderLinkId' if venue == 'bybit' else 'clOrdId'
+        seen_ids = {fields[client]}
+        partials = record.get('partial_closes', [])
+        if not isinstance(partials, list) or len(partials) > 20 or (partials and not has_open):
+            raise ValueError('Invalid partial closes')
+        for partial in partials:
+            close, fill = partial['request'], partial['reconciled_fill']
+            _validate_route(venue, 'POST', None, close)
+            qty = _number(fill['filled_qty'])
+            if (partial.get('venue') != venue or close.get('reduceOnly') is not True or close[symbol] != fields[symbol] or
+                    close['side'].lower() == fields['side'].lower() or close[client] in seen_ids or
+                    _quantity(close[amount_key]) != effective or fill.get('venue') != venue or
+                    fill.get('state') not in ('Cancelled', 'Rejected', 'Deactivated', 'PartiallyFilledCanceled', 'canceled') or
+                    fill.get('order_id') != partial.get('order_id') or not isinstance(partial.get('order_id'), str) or
+                    not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', partial['order_id']) or qty < 0 or qty >= effective or
+                    (qty > 0 and _quantity(fill['avg_price']) <= 0)):
+                raise ValueError('Invalid partial close')
+            seen_ids.add(close[client])
+            effective -= qty
+        if partials and _quantity(record['remaining_qty']) != effective:
+            raise ValueError('Invalid remaining quantity')
+        pending = record.get('pending_recovery')
+        if pending is not None:
+            _validate_recovered_leg(pending, record['base'])
+            if pending['venue'] == venue or record.get('recovered_from_pair') is not True:
+                raise ValueError('Invalid recovery companion')
+        previous = record.get('prior_recoveries', [])
+        if not isinstance(previous, list) or len(previous) > 1 or (previous and record.get('recovered_from_pair') is not True):
+            raise ValueError('Invalid prior recovery')
+        if pending is not None and (previous or state == 'closed_confirmed'):
+            raise ValueError('Invalid pending recovery')
+        for item in previous:
+            _validate_recovered_leg(item, record['base'])
+            if item['venue'] == venue:
+                raise ValueError('Invalid prior venue')
+        if record['state'] == 'closed_confirmed':
+            closing = record['closing']
+            if not isinstance(closing, list) or len(closing) != 1 or closing[0]['venue'] != venue:
+                raise ValueError('Invalid close')
+            close = closing[0]['request']
+            _validate_route(venue, 'POST', None, close)
+            key = 'qty' if venue == 'bybit' else 'sz'
+            confirm = closing[0]['confirmation']
+            if (close.get('reduceOnly') is not True or close[symbol] != fields[symbol] or
+                    close['side'].lower() == fields['side'].lower() or close[client] in seen_ids or
+                    _quantity(close[key]) != effective or confirm.get('venue') != venue or
+                    confirm.get('order_id') != closing[0].get('order_id') or
+                    _quantity(confirm['filled_qty']) != _quantity(close[key]) or _quantity(confirm['avg_price']) <= 0):
+                raise ValueError('Close not confirmed')
+        return record
+    except Exception:
+        raise DemoBlocked('Single demo journal unavailable or invalid') from None
+
+
+def _validate_recovered_leg(leg: dict[str, Any], base: str) -> Decimal:
+    if not isinstance(leg, dict) or leg.get('venue') not in _VENUES or not isinstance(leg.get('request'), dict):
+        raise ValueError('Invalid recovered leg')
+    venue, fields = leg['venue'], leg['request']
+    _validate_route(venue, 'POST', None, fields)
+    symbol, amount = ('symbol', 'qty') if venue == 'bybit' else ('instId', 'sz')
+    proof = leg.get('reconciled_fill') or leg.get('confirmation')
+    if (fields.get('reduceOnly') is not None or fields[symbol] != base + ('USDT' if venue == 'bybit' else '-USDT-SWAP') or
+            not isinstance(proof, dict) or proof.get('venue') != venue or proof.get('order_id') != leg.get('order_id') or
+            not isinstance(leg.get('order_id'), str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', leg['order_id']) or
+            _quantity(proof['avg_price']) <= 0):
+        raise ValueError('Invalid recovered proof')
+    qty = _quantity(proof['filled_qty'])
+    if qty > _quantity(fields[amount]) or (leg.get('reconciled_fill') is None and qty != _quantity(fields[amount])):
+        raise ValueError('Invalid recovered quantity')
+    if leg.get('reconciled_fill') is not None and proof.get('state') not in ('Filled', 'Cancelled', 'Rejected', 'Deactivated', 'PartiallyFilledCanceled', 'filled', 'canceled'):
+        raise ValueError('Recovered order not terminal')
+    if proof.get('state') in ('Filled', 'filled') and qty != _quantity(fields[amount]):
+        raise ValueError('Full-fill proof mismatches order quantity')
+    return qty
+
+
+def _finish_single_close(path: Path, record: dict[str, Any], max_age_ms: int) -> dict[str, Any]:
+    """After a confirmed close, preserve and validate the other recovered leg."""
+    from execution import demo_futures_data
+    for prior in record.get('prior_recoveries', []):
+        demo_futures_data.verify_single_position(prior['venue'], record['base'], prior['request'], flat=True, max_age_ms=max_age_ms)
+    pending = record.get('pending_recovery')
+    if pending is None:
+        record['state'] = 'closed_confirmed'
+        _write_journal(path, record)
+        return {'state': record['state'], 'id': record['id']}
+    qty = _validate_recovered_leg(pending, record['base'])
+    fields = dict(pending['request'])
+    fields['qty' if pending['venue'] == 'bybit' else 'sz'] = format(qty, 'f')
+    demo_futures_data.verify_single_position(pending['venue'], record['base'], fields, flat=False, max_age_ms=max_age_ms)
+    completed = dict(record['legs'][0])
+    completed['close_history'] = list(record.get('partial_closes', [])) + list(record['closing'])
+    prior = list(record.get('prior_recoveries', [])) + [completed]
+    next_record = {'version': 1, 'kind': 'single', 'id': record['id'], 'base': record['base'],
+                   'state': 'open_confirmed' if qty == _quantity(pending['request']['qty' if pending['venue'] == 'bybit' else 'sz']) else 'open_partial_confirmed',
+                   'legs': [pending], 'recovered_from_pair': True, 'prior_recoveries': prior}
+    _write_journal(path, next_record)
+    return {'state': 'next_leg_pending', 'id': record['id'], 'venue': pending['venue']}
+
+
+def _archive_confirmed_closed_single(path: Path, max_age_ms: int) -> None:
+    from execution import demo_futures_data
+    record = _read_single_journal(path, states=frozenset({'closed_confirmed'}))
+    leg = record['legs'][0]
+    try:
+        demo_futures_data.verify_single_position(leg['venue'], record['base'], leg['request'], flat=True,
+                                                  max_age_ms=max_age_ms)
+        for prior in record.get('prior_recoveries', []):
+            demo_futures_data.verify_single_position(prior['venue'], record['base'], prior['request'], flat=True,
+                                                      max_age_ms=max_age_ms)
+        archive = path.parent / ('demo-futures-closed-' + record['id'] + '.json')
+        os.link(path, archive, follow_symlinks=False)
+        os.unlink(path)
+        if os.name != 'nt':
+            dfd = os.open(path.parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+            try: os.fsync(dfd)
+            finally: os.close(dfd)
+    except Exception:
+        raise DemoBlocked('Closed single leg cannot be archived safely') from None
+
+
+def execute_single(pair: FuturesPair, venue: str, side: str, *, confirmed: bool = False, risk_limits=None) -> dict[str, Any]:
+    """Submit one journalled market leg only after demo-only technical preflight."""
+    from execution import demo_futures_data
+    from execution.demo_futures_preflight import RiskLimits, TechnicalLimits
+    if venue not in _VENUES or side not in ('buy', 'sell') or not isinstance(risk_limits, (RiskLimits, TechnicalLimits)):
+        raise DemoBlocked('Invalid single order')
+    pair.validate()
+    _permit(confirmed, opening=True)
+    path = _journal_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    locked = False
+    try:
+        locked = lock_exclusive(fd, blocking=False)
+        if not locked:
+            raise DemoBlocked('Another demo operation is in progress')
+        _permit(confirmed, opening=True)
+        if path.exists() or path.is_symlink():
+            try:
+                _archive_confirmed_closed_pair(path, risk_limits)
+            except DemoBlocked:
+                _archive_confirmed_closed_single(path, risk_limits.max_snapshot_age_ms)
+        demo_futures_data.verify_technical_open(pair, max_age_ms=risk_limits.max_snapshot_age_ms, venues=(venue,))
+        qty = pair.base_quantity if venue == 'bybit' else pair.okx_contracts
+        fields = _order_fields(venue, pair.base, side, qty, uuid.uuid4().hex[:24])
+        record: dict[str, Any] = {'version': 1, 'kind': 'single', 'id': uuid.uuid4().hex,
+                                  'state': 'prepared', 'base': pair.base,
+                                  'legs': [{'venue': venue, 'request': fields}]}
+        _write_journal(path, record)
+        token = _PAIR_ACTIVE.set(True)
+        try:
+            record['state'] = 'leg_1_submitting'
+            _write_journal(path, record)
+            def save_ack(order_id: str) -> None:
+                record['legs'][0]['order_id'] = order_id
+                record['state'] = 'leg_1_acknowledged'
+                _write_journal(path, record)
+            try:
+                record['legs'][0]['confirmation'] = _create_and_confirm(venue, fields, confirmed, save_ack)
+                _write_journal(path, record)
+                demo_futures_data.verify_single_position(venue, pair.base, fields, flat=False,
+                                                          max_age_ms=risk_limits.max_snapshot_age_ms)
+            except Exception:
+                record['state'], record['uncertain_leg'] = 'reconciliation_required', 0
+                _write_journal(path, record)
+                return {'state': record['state'], 'id': record['id']}
+            record['state'] = 'open_confirmed'
+            _write_journal(path, record)
+            return {'state': record['state'], 'id': record['id']}
+        finally:
+            _PAIR_ACTIVE.reset(token)
+    finally:
+        if locked:
+            unlock(fd)
+        os.close(fd)
+
+
+def close_single(*, confirmed: bool = False, risk_limits=None) -> dict[str, Any]:
+    """Close the verified journalled single position with reduce-only."""
+    from execution import demo_futures_data
+    from execution.demo_futures_preflight import RiskLimits, TechnicalLimits
+    _permit(confirmed)
+    if not isinstance(risk_limits, (RiskLimits, TechnicalLimits)):
+        raise DemoBlocked('Explicit close limits required')
+    path = _journal_path()
+    if not path.parent.is_dir():
+        raise DemoBlocked('Opening journal unavailable')
+    fd = os.open(path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    locked = False
+    try:
+        locked = lock_exclusive(fd, blocking=False)
+        if not locked:
+            raise DemoBlocked('Another demo operation is in progress')
+        _permit(confirmed)
+        record = _read_single_journal(path, states=frozenset({'open_confirmed', 'open_partial_confirmed'}))
+        leg, base = record['legs'][0], record['base']
+        venue, opening = leg['venue'], dict(leg['request'])
+        key = 'qty' if venue == 'bybit' else 'sz'
+        if 'remaining_qty' in record:
+            opening[key] = record['remaining_qty']
+        elif 'reconciled_fill' in leg:
+            opening[key] = leg['reconciled_fill']['filled_qty']
+        close = _order_fields(venue, base, 'sell' if opening['side'].lower() == 'buy' else 'buy',
+                              opening[key], uuid.uuid4().hex[:24], reduce_only=True)
+        client_key = 'orderLinkId' if venue == 'bybit' else 'clOrdId'
+        used_clients = {opening[client_key]} | {item['request'][client_key] for item in record.get('partial_closes', [])}
+        if close[client_key] in used_clients:
+            raise DemoBlocked('Duplicate order identity')
+        position_at = demo_futures_data.verify_single_position(venue, base, opening, flat=False, max_age_ms=risk_limits.max_snapshot_age_ms)
+        market_at = demo_futures_data.verify_single_close_instrument(venue, base, close, max_age_ms=risk_limits.max_snapshot_age_ms)
+        now = int(time.time() * 1000)
+        if any(stamp > now or now - stamp > risk_limits.max_snapshot_age_ms for stamp in (position_at, market_at)):
+            raise DemoBlocked('Single close evidence expired')
+        record['closing'] = [{'venue': venue, 'request': close}]
+        record['state'] = 'close_prepared'
+        _write_journal(path, record)
+        token = _PAIR_ACTIVE.set(True)
+        try:
+            record['state'] = 'close_1_submitting'
+            _write_journal(path, record)
+            def save_ack(order_id: str) -> None:
+                record['closing'][0]['order_id'] = order_id
+                record['state'] = 'close_1_acknowledged'
+                _write_journal(path, record)
+            try:
+                record['closing'][0]['confirmation'] = _create_and_confirm(venue, close, confirmed, save_ack)
+                _write_journal(path, record)
+                demo_futures_data.verify_single_position(venue, base, opening, flat=True, max_age_ms=risk_limits.max_snapshot_age_ms)
+            except Exception:
+                record['state'], record['uncertain_close'] = 'close_reconciliation_required', 0
+                _write_journal(path, record)
+                return {'state': record['state'], 'id': record['id']}
+            return _finish_single_close(path, record, risk_limits.max_snapshot_age_ms)
+        finally:
+            _PAIR_ACTIVE.reset(token)
+    finally:
+        if locked:
+            unlock(fd)
+        os.close(fd)
+
+
+def reconcile_single(*, confirmed: bool = False, max_age_ms: int = 30_000) -> dict[str, Any]:
+    """Resolve terminal single orders from demo evidence without sending orders."""
+    from execution import demo_futures_data
+    if confirmed is not True:
+        raise DemoBlocked('Explicit reconciliation confirmation required')
+    _permit(False, read_only=True)
+    path = _journal_path()
+    if not path.parent.is_dir():
+        raise DemoBlocked('Journal unavailable')
+    fd = os.open(path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    locked = False
+    try:
+        locked = lock_exclusive(fd, blocking=False)
+        if not locked:
+            raise DemoBlocked('Another demo operation is in progress')
+        states = frozenset({'leg_1_submitting', 'leg_1_acknowledged', 'reconciliation_required',
+                            'close_1_submitting', 'close_1_acknowledged', 'close_reconciliation_required',
+                            'cancel_submitting', 'cancel_reconciliation_required'})
+        record = _read_single_journal(path, states=states)
+        state = record['state']
+        if state.startswith('cancel_'):
+            state = record.get('cancellation', {}).get('previous_state')
+        closing = isinstance(state, str) and state.startswith('close_')
+        entries = record.get('closing') if closing else record['legs']
+        if not isinstance(entries, list) or len(entries) != 1 or entries[0].get('venue') != record['legs'][0]['venue']:
+            raise DemoBlocked('Invalid uncertain order')
+        leg = entries[0]
+        venue, fields = leg['venue'], leg['request']
+        opening = record['legs'][0]['request']
+        key = 'qty' if venue == 'bybit' else 'sz'
+        symbol = 'symbol' if venue == 'bybit' else 'instId'
+        client = 'orderLinkId' if venue == 'bybit' else 'clOrdId'
+        if closing:
+            _validate_route(venue, 'POST', None, fields)
+            original = record['legs'][0]
+            evidence = original.get('reconciled_fill') or original.get('confirmation')
+            if (not isinstance(evidence, dict) or evidence.get('venue') != venue or
+                    evidence.get('order_id') != original.get('order_id') or
+                    fields.get('reduceOnly') is not True or fields[symbol] != opening[symbol] or
+                    fields['side'].lower() == opening['side'].lower() or fields[client] == opening[client] or
+                    fields[client] in {item['request'][client] for item in record.get('partial_closes', [])} or
+                    _quantity(fields[key]) != _quantity(record.get('remaining_qty', evidence['filled_qty']))):
+                raise DemoBlocked('Closing intent is inconsistent')
+        status = demo_futures_data.lookup_single_terminal_fill(venue, record['base'], fields,
+                                                                 order_id=leg.get('order_id'), max_age_ms=max_age_ms)
+        amount = _number(status['filled_qty'])
+        if closing:
+            if amount != _quantity(fields[key]):
+                remaining = _quantity(fields[key]) - amount
+                effective = dict(opening)
+                effective[key] = format(remaining, 'f')
+                demo_futures_data.verify_single_position(venue, record['base'], effective, flat=False, max_age_ms=max_age_ms)
+                partials = record.setdefault('partial_closes', [])
+                if len(partials) >= 20:
+                    raise DemoBlocked('Too many partial closes')
+                leg['order_id'] = status['order_id']
+                leg['reconciled_fill'] = status
+                partials.append(leg)
+                record.pop('closing', None)
+                record['remaining_qty'] = format(remaining, 'f')
+                record['state'] = 'open_partial_confirmed'
+                _write_journal(path, record)
+                return {'state': record['state'], 'remaining_qty': record['remaining_qty'], 'order': status}
+            demo_futures_data.verify_single_position(venue, record['base'], opening, flat=True, max_age_ms=max_age_ms)
+            leg['order_id'] = status['order_id']
+            leg['confirmation'] = {k: status[k] for k in ('venue', 'order_id', 'filled_qty', 'avg_price')}
+            result = _finish_single_close(path, record, max_age_ms)
+            result['order'] = status
+            return result
+        if amount == 0:
+            demo_futures_data.verify_single_position(venue, record['base'], opening, flat=True, max_age_ms=max_age_ms)
+            leg['order_id'] = status['order_id']
+            leg['reconciled_fill'] = status
+            record['state'] = 'manually_resolved_flat'
+            _write_journal(path, record)
+            archive = path.parent / ('demo-futures-resolved-' + record['id'] + '.json')
+            os.link(path, archive, follow_symlinks=False)
+            os.unlink(path)
+            if os.name != 'nt':
+                dfd = os.open(path.parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+                try: os.fsync(dfd)
+                finally: os.close(dfd)
+            return {'state': record['state'], 'order': status}
+        effective = dict(opening)
+        effective[key] = status['filled_qty']
+        demo_futures_data.verify_single_position(venue, record['base'], effective, flat=False, max_age_ms=max_age_ms)
+        leg['order_id'] = status['order_id']
+        leg['reconciled_fill'] = status
+        record['state'] = 'open_confirmed' if amount == _quantity(opening[key]) else 'open_partial_confirmed'
+        _write_journal(path, record)
+        return {'state': record['state'], 'order': status}
+    except DemoBlocked:
+        raise
+    except Exception:
+        raise DemoBlocked('Single order could not be reconciled safely') from None
+    finally:
+        if locked:
+            unlock(fd)
+        os.close(fd)
+
+
+def reconcile_pair_first_leg(*, confirmed: bool = False, max_age_ms: int = 30_000) -> dict[str, Any]:
+    """Recover a terminal first leg when the second leg was never submitted."""
+    import stat
+    from execution import demo_futures_data
+    if confirmed is not True:
+        raise DemoBlocked('Explicit reconciliation confirmation required')
+    _permit(False, read_only=True)
+    path = _journal_path()
+    if not path.parent.is_dir(): raise DemoBlocked('Journal unavailable')
+    fd = os.open(path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    locked = False
+    try:
+        locked = lock_exclusive(fd, blocking=False)
+        if not locked: raise DemoBlocked('Another demo operation is in progress')
+        raw_fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        with os.fdopen(raw_fd, 'rb') as file:
+            info = os.fstat(file.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_size > 1_048_576 or
+                    (os.name != 'nt' and (info.st_uid != os.geteuid() or info.st_mode & 0o077))):
+                raise ValueError('Unsafe journal')
+            record = json.loads(file.read(1_048_577))
+        if (not isinstance(record, dict) or type(record.get('version')) is not int or record['version'] != 1 or
+                record.get('kind') is not None or not isinstance(record.get('id'), str) or
+                not re.fullmatch(r'[a-f0-9]{32}', record['id']) or not isinstance(record.get('legs'), list) or len(record['legs']) != 2):
+            raise ValueError('Invalid pair')
+        state = record.get('state')
+        if state in ('cancel_submitting', 'cancel_reconciliation_required'):
+            state = record.get('cancellation', {}).get('previous_state')
+        if state == 'reconciliation_required' and record.get('uncertain_leg') == 0:
+            pass
+        elif state not in ('leg_1_submitting', 'leg_1_acknowledged', 'leg_1_filled', 'leg_1_reconciled'):
+            return {'state': 'manual_reconciliation_required', 'reason': 'not_first_leg'}
+        first, second = record['legs']
+        if (not isinstance(first, dict) or not isinstance(second, dict) or
+                {first.get('venue'), second.get('venue')} != _VENUES or
+                'order_id' in second or 'confirmation' in second):
+            raise ValueError('Second leg may have been submitted')
+        for index, leg in enumerate((first, second)):
+            _validate_route(leg['venue'], 'POST', None, leg['request'])
+            symbol = 'symbol' if leg['venue'] == 'bybit' else 'instId'
+            if (leg['request'].get('reduceOnly') is not None or
+                    leg['request'][symbol] != record['base'] + ('USDT' if leg['venue'] == 'bybit' else '-USDT-SWAP') or
+                    leg['request']['side'].lower() != ('buy' if index == 0 else 'sell')):
+                raise ValueError('Invalid pair intent')
+        bybit = next(leg for leg in (first, second) if leg['venue'] == 'bybit')
+        okx = next(leg for leg in (first, second) if leg['venue'] == 'okx')
+        pair = FuturesPair(record['base'], first['venue'], second['venue'], bybit['request']['qty'],
+                           okx['request']['sz'], record['okx_contract_size'])
+        pair.validate()
+        if bybit['request']['orderLinkId'] == okx['request']['clOrdId']:
+            raise ValueError('Duplicate client identifiers')
+        proof = demo_futures_data.lookup_single_terminal_fill(first['venue'], pair.base, first['request'],
+                                                                order_id=first.get('order_id'), max_age_ms=max_age_ms)
+        quantity = _number(proof['filled_qty'])
+        prior = first.get('confirmation')
+        if prior is not None and (not isinstance(prior, dict) or prior.get('order_id') != proof['order_id'] or
+                                  _quantity(prior['filled_qty']) != quantity or _quantity(prior['avg_price']) != _quantity(proof['avg_price'])):
+            raise ValueError('Conflicting confirmation')
+        demo_futures_data.verify_single_position(second['venue'], pair.base, second['request'], flat=True, max_age_ms=max_age_ms)
+        effective = dict(first['request'])
+        effective['qty' if first['venue'] == 'bybit' else 'sz'] = proof['filled_qty']
+        demo_futures_data.verify_single_position(first['venue'], pair.base, effective if quantity else first['request'],
+                                                  flat=quantity == 0, max_age_ms=max_age_ms)
+        backup = path.parent / ('demo-futures-pair-recovery-' + record['id'] + '.json')
+        try:
+            os.link(path, backup, follow_symlinks=False)
+        except FileExistsError:
+            if not os.path.samefile(path, backup):
+                raise
+        if quantity == 0:
+            os.unlink(path)
+            state = 'manually_resolved_flat'
+        else:
+            first['order_id'] = proof['order_id']
+            first['reconciled_fill'] = proof
+            state = ('open_confirmed' if quantity == _quantity(first['request']['qty' if first['venue'] == 'bybit' else 'sz'])
+                     else 'open_partial_confirmed')
+            recovered = {'version': 1, 'kind': 'single', 'id': record['id'], 'state': state,
+                         'base': pair.base, 'legs': [first], 'recovered_from_pair': True}
+            _write_journal(path, recovered)
+        if os.name != 'nt':
+            dfd = os.open(path.parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+            try: os.fsync(dfd)
+            finally: os.close(dfd)
+        return {'state': state, 'order': proof, 'recovered_from_pair': True}
+    except DemoBlocked:
+        raise
+    except Exception:
+        raise DemoBlocked('Pair first leg could not be reconciled safely') from None
+    finally:
+        if locked: unlock(fd)
+        os.close(fd)
+
+
+def reconcile_pair_second_leg(*, confirmed: bool = False, max_age_ms: int = 30_000) -> dict[str, Any]:
+    """Recover terminal second-leg evidence without resubmitting either leg."""
+    import stat
+    from execution import demo_futures_data
+    if confirmed is not True: raise DemoBlocked('Explicit reconciliation confirmation required')
+    _permit(False, read_only=True)
+    path = _journal_path()
+    if not path.parent.is_dir(): raise DemoBlocked('Journal unavailable')
+    fd = os.open(path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    locked = False
+    try:
+        locked = lock_exclusive(fd, blocking=False)
+        if not locked: raise DemoBlocked('Another demo operation is in progress')
+        raw_fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        with os.fdopen(raw_fd, 'rb') as file:
+            info = os.fstat(file.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_size > 1_048_576 or
+                    (os.name != 'nt' and (info.st_uid != os.geteuid() or info.st_mode & 0o077))):
+                raise ValueError('Unsafe journal')
+            record = json.loads(file.read(1_048_577))
+        if (not isinstance(record, dict) or type(record.get('version')) is not int or record['version'] != 1 or
+                record.get('kind') is not None or not isinstance(record.get('id'), str) or
+                not re.fullmatch(r'[a-f0-9]{32}', record['id']) or not isinstance(record.get('legs'), list) or len(record['legs']) != 2):
+            raise ValueError('Invalid pair')
+        state = record.get('state')
+        if state in ('cancel_submitting', 'cancel_reconciliation_required'):
+            state = record.get('cancellation', {}).get('previous_state')
+        if state == 'reconciliation_required' and record.get('uncertain_leg') == 1:
+            pass
+        elif state not in ('leg_2_submitting', 'leg_2_acknowledged', 'leg_2_filled', 'leg_2_reconciled', 'position_reconciliation_required'):
+            return {'state': 'manual_reconciliation_required', 'reason': 'not_second_leg'}
+        first, second = record['legs']
+        if (not isinstance(first, dict) or not isinstance(second, dict) or {first.get('venue'), second.get('venue')} != _VENUES):
+            raise ValueError('Invalid venues')
+        first_quantity = _validate_recovered_leg(first, record['base'])
+        if first_quantity != _quantity(first['request']['qty' if first['venue'] == 'bybit' else 'sz']):
+            raise ValueError('First leg was not fully filled')
+        for index, leg in enumerate((first, second)):
+            _validate_route(leg['venue'], 'POST', None, leg['request'])
+            symbol = 'symbol' if leg['venue'] == 'bybit' else 'instId'
+            if (leg['request'].get('reduceOnly') is not None or
+                    leg['request'][symbol] != record['base'] + ('USDT' if leg['venue'] == 'bybit' else '-USDT-SWAP') or
+                    leg['request']['side'].lower() != ('buy' if index == 0 else 'sell')):
+                raise ValueError('Invalid pair intent')
+        bybit = next(leg for leg in (first, second) if leg['venue'] == 'bybit')
+        okx = next(leg for leg in (first, second) if leg['venue'] == 'okx')
+        pair = FuturesPair(record['base'], first['venue'], second['venue'], bybit['request']['qty'],
+                           okx['request']['sz'], record['okx_contract_size'])
+        pair.validate()
+        if bybit['request']['orderLinkId'] == okx['request']['clOrdId']:
+            raise ValueError('Duplicate client identifiers')
+        proof = demo_futures_data.lookup_single_terminal_fill(second['venue'], pair.base, second['request'],
+                                                                order_id=second.get('order_id'), max_age_ms=max_age_ms)
+        quantity = _number(proof['filled_qty'])
+        prior = second.get('confirmation')
+        if prior is not None and (not isinstance(prior, dict) or prior.get('order_id') != proof['order_id'] or
+                                  _quantity(prior['filled_qty']) != quantity or _quantity(prior['avg_price']) != _quantity(proof['avg_price'])):
+            raise ValueError('Conflicting confirmation')
+        demo_futures_data.verify_single_position(first['venue'], pair.base, first['request'], flat=False, max_age_ms=max_age_ms)
+        second_fields = dict(second['request'])
+        second_fields['qty' if second['venue'] == 'bybit' else 'sz'] = proof['filled_qty']
+        demo_futures_data.verify_single_position(second['venue'], pair.base, second_fields if quantity else second['request'],
+                                                  flat=quantity == 0, max_age_ms=max_age_ms)
+        backup = path.parent / ('demo-futures-pair-recovery-' + record['id'] + '.json')
+        try: os.link(path, backup, follow_symlinks=False)
+        except FileExistsError:
+            if not os.path.samefile(path, backup): raise
+        if quantity == _quantity(second['request']['qty' if second['venue'] == 'bybit' else 'sz']):
+            second['order_id'] = proof['order_id']
+            second['confirmation'] = {key: proof[key] for key in ('venue', 'order_id', 'filled_qty', 'avg_price')}
+            record['state'] = 'open_confirmed'
+            _write_journal(path, record)
+            return {'state': 'open_confirmed', 'order': proof}
+        if quantity:
+            second['order_id'] = proof['order_id']
+            second['reconciled_fill'] = proof
+            active, pending = second, first
+            recovered_state = 'open_partial_confirmed'
+        else:
+            active, pending = first, None
+            recovered_state = 'open_confirmed'
+        recovered = {'version': 1, 'kind': 'single', 'id': record['id'], 'state': recovered_state,
+                     'base': pair.base, 'legs': [active], 'recovered_from_pair': True}
+        if pending is not None:
+            recovered['pending_recovery'] = pending
+        _write_journal(path, recovered)
+        return {'state': recovered_state, 'order': proof, 'recovered_from_pair': True,
+                'pending_leg': pending['venue'] if pending else None}
+    except DemoBlocked:
+        raise
+    except Exception:
+        raise DemoBlocked('Pair second leg could not be reconciled safely') from None
+    finally:
+        if locked: unlock(fd)
+        os.close(fd)
+
+
+def reconcile_pair_closing(*, confirmed: bool = False, max_age_ms: int = 30_000) -> dict[str, Any]:
+    """Resolve terminal pair-close evidence, retaining any verified residual legs."""
+    from execution import demo_futures_data
+    if confirmed is not True: raise DemoBlocked('Explicit reconciliation confirmation required')
+    _permit(False, read_only=True)
+    path = _journal_path()
+    if not path.parent.is_dir(): raise DemoBlocked('Journal unavailable')
+    fd = os.open(path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    locked = False
+    try:
+        locked = lock_exclusive(fd, blocking=False)
+        if not locked: raise DemoBlocked('Another demo operation is in progress')
+        states = frozenset({'close_prepared', 'close_1_submitting', 'close_1_acknowledged', 'close_1_filled',
+                            'close_1_reconciled', 'close_2_submitting', 'close_2_acknowledged', 'close_2_filled',
+                            'close_2_reconciled', 'close_reconciliation_required'})
+        # Cancels keep the original state separately; accept them only after the
+        # exact close intent and terminal result have been validated below.
+        pair, record = _read_open_journal_for_close(path, allowed_states=states | frozenset({'cancel_submitting', 'cancel_reconciliation_required'}))
+        state = record['state']
+        if state.startswith('cancel_'):
+            state = record.get('cancellation', {}).get('previous_state')
+        if state == 'close_reconciliation_required':
+            index = record.get('uncertain_close')
+        elif state == 'close_prepared':
+            index = -1
+        elif isinstance(state, str) and state.startswith('close_1_'):
+            index = 0
+        elif isinstance(state, str) and state.startswith('close_2_'):
+            index = 1
+        else:
+            return {'state': 'manual_reconciliation_required', 'reason': 'not_closing'}
+        if type(index) is not int or index not in (-1, 0, 1): raise ValueError('Invalid close index')
+        closing = record.get('closing')
+        if not isinstance(closing, list) or len(closing) != 2: raise ValueError('Invalid close intent')
+        opening = list(reversed(record['legs']))
+        seen = {leg['request']['orderLinkId' if leg['venue'] == 'bybit' else 'clOrdId'] for leg in opening}
+        for index_check, (leg, original) in enumerate(zip(closing, opening)):
+            venue = original['venue']
+            if not isinstance(leg, dict) or leg.get('venue') != venue: raise ValueError('Wrong venue')
+            fields, before = leg['request'], original['request']
+            _validate_route(venue, 'POST', None, fields)
+            symbol, amount, client = (('symbol', 'qty', 'orderLinkId') if venue == 'bybit' else ('instId', 'sz', 'clOrdId'))
+            if (fields.get('reduceOnly') is not True or fields[symbol] != before[symbol] or
+                    fields['side'].lower() == before['side'].lower() or fields[client] in seen or
+                    _quantity(fields[amount]) != _quantity(before[amount])):
+                raise ValueError('Invalid close request')
+            seen.add(fields[client])
+            if index_check > index and ('order_id' in leg or 'confirmation' in leg):
+                raise ValueError('Later close may have been submitted')
+        if index == -1:
+            for original in opening:
+                demo_futures_data.verify_single_position(original['venue'], pair.base, original['request'], flat=False, max_age_ms=max_age_ms)
+            record.pop('closing', None)
+            record['state'] = 'open_confirmed'
+            _write_journal(path, record)
+            return {'state': 'open_confirmed', 'reason': 'close_not_submitted'}
+        if index == 1:
+            previous = closing[0]
+            proof0 = previous.get('confirmation')
+            if (not isinstance(proof0, dict) or proof0.get('venue') != previous['venue'] or
+                    proof0.get('order_id') != previous.get('order_id') or
+                    _quantity(proof0['filled_qty']) != _quantity(previous['request']['qty' if previous['venue'] == 'bybit' else 'sz']) or
+                    _quantity(proof0['avg_price']) <= 0):
+                raise ValueError('Previous close unconfirmed')
+            demo_futures_data.verify_single_position(opening[0]['venue'], pair.base, opening[0]['request'], flat=True, max_age_ms=max_age_ms)
+        target, original = closing[index], opening[index]
+        venue, fields = target['venue'], target['request']
+        key = 'qty' if venue == 'bybit' else 'sz'
+        proof = demo_futures_data.lookup_single_terminal_fill(venue, pair.base, fields, order_id=target.get('order_id'), max_age_ms=max_age_ms)
+        filled = _number(proof['filled_qty'])
+        remaining = _quantity(fields[key]) - filled
+        effective = dict(original['request'])
+        effective[key] = format(remaining, 'f') if remaining else effective[key]
+        demo_futures_data.verify_single_position(venue, pair.base, effective, flat=remaining == 0, max_age_ms=max_age_ms)
+        if index == 0:
+            demo_futures_data.verify_single_position(opening[1]['venue'], pair.base, opening[1]['request'], flat=False, max_age_ms=max_age_ms)
+        backup = path.parent / ('demo-futures-pair-recovery-' + record['id'] + '.json')
+        try: os.link(path, backup, follow_symlinks=False)
+        except FileExistsError:
+            if not os.path.samefile(path, backup): raise
+        if index == 1 and remaining == 0:
+            target['order_id'] = proof['order_id']
+            target['confirmation'] = {k: proof[k] for k in ('venue', 'order_id', 'filled_qty', 'avg_price')}
+            record['state'] = 'closed_confirmed'
+            _write_journal(path, record)
+            return {'state': 'closed_confirmed', 'order': proof}
+        if remaining:
+            active = dict(original)
+            target['order_id'] = proof['order_id']
+            target['reconciled_fill'] = proof
+            recovered = {'version': 1, 'kind': 'single', 'id': record['id'], 'base': pair.base,
+                         'state': 'open_partial_confirmed', 'legs': [active], 'recovered_from_pair': True,
+                         'remaining_qty': format(remaining, 'f'), 'partial_closes': [target]}
+            if index == 0:
+                recovered['pending_recovery'] = opening[1]
+            else:
+                previous = dict(opening[0])
+                previous['close_history'] = [closing[0]]
+                recovered['prior_recoveries'] = [previous]
+        else:
+            # The first close is confirmed; retain its history while the other
+            # opening is still live and must be explicitly closed.
+            previous = dict(opening[0])
+            target['order_id'] = proof['order_id']
+            target['confirmation'] = {k: proof[k] for k in ('venue', 'order_id', 'filled_qty', 'avg_price')}
+            previous['close_history'] = [target]
+            recovered = {'version': 1, 'kind': 'single', 'id': record['id'], 'base': pair.base,
+                         'state': 'open_confirmed', 'legs': [opening[1]], 'recovered_from_pair': True,
+                         'prior_recoveries': [previous]}
+        _write_journal(path, recovered)
+        return {'state': recovered['state'], 'order': proof, 'recovered_from_pair': True}
+    except DemoBlocked:
+        raise
+    except Exception:
+        raise DemoBlocked('Pair close could not be reconciled safely') from None
+    finally:
+        if locked: unlock(fd)
+        os.close(fd)
+
+
+def cancel_open_order(venue: str, base: str, client_id: str, *, confirmed: bool = False) -> dict[str, Any]:
+    """Cancel an observed open demo futures order once, with a durable intent."""
+    from execution import demo_futures_data
+    _permit(confirmed)
+    if (venue not in _VENUES or not isinstance(base, str) or not re.fullmatch(r'[A-Z][A-Z0-9]{1,14}', base) or
+            not isinstance(client_id, str) or not re.fullmatch(r'[A-Za-z0-9]{1,24}', client_id)):
+        raise DemoBlocked('Invalid order identity')
+    directory = execution_mode._directory()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    main = _journal_path()
+    path = directory / 'demo-futures-cancel-intent.json'
+    fd = os.open(main.with_suffix('.lock'), os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    locked = False
+    try:
+        locked = lock_exclusive(fd, blocking=False)
+        if not locked or path.exists() or path.is_symlink(): raise DemoBlocked('Another operation requires reconciliation')
+        _permit(confirmed)
+        # Do not modify an already uncertain pair/single intent.
+        if main.exists() or main.is_symlink():
+            try: _read_open_journal_for_close(main, allowed_states=frozenset({'open_confirmed', 'closed_confirmed'}))
+            except DemoBlocked: _read_single_journal(main, states=frozenset({'open_confirmed', 'open_partial_confirmed', 'closed_confirmed'}))
+        payload = demo_futures_data.read(venue, base, 'orders').payload
+        if venue == 'bybit':
+            block = payload['result']
+            rows = block['list']
+            if block['nextPageCursor'] != '': raise ValueError('Incomplete open orders')
+            matches = [row for row in rows if row.get('orderLinkId') == client_id and row.get('symbol') == base + 'USDT']
+            oid_key, qty_key, status_key, terminal = 'orderId', 'qty', 'orderStatus', ('New', 'PartiallyFilled')
+        else:
+            rows = payload['data']
+            if len(rows) >= 100: raise ValueError('Incomplete open orders')
+            matches = [row for row in rows if row.get('clOrdId') == client_id and row.get('instId') == base + '-USDT-SWAP']
+            oid_key, qty_key, status_key, terminal = 'ordId', 'sz', 'state', ('live', 'partially_filled')
+        if not isinstance(rows, list) or len(matches) != 1: raise ValueError('Order not uniquely open')
+        row = matches[0]
+        order_id = row[oid_key]
+        if (not isinstance(order_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', order_id) or
+                row[status_key] not in terminal or row['side'].lower() not in ('buy', 'sell')):
+            raise ValueError('Invalid open order')
+        fields = _order_fields(venue, base, row['side'].lower(), row[qty_key], client_id,
+                               reduce_only=row.get('reduceOnly') in (True, 'true'))
+        record = {'version': 1, 'id': uuid.uuid4().hex, 'state': 'cancel_submitting', 'venue': venue,
+                  'base': base, 'order_id': order_id, 'fields': fields}
+        _write_journal(path, record)
+        body = ({'category': 'linear', 'symbol': fields['symbol'], 'orderLinkId': client_id} if venue == 'bybit'
+                else {'instId': fields['instId'], 'clOrdId': client_id})
+        pair_token = _PAIR_ACTIVE.set(True)
+        cancel_token = _EXTERNAL_CANCEL_ACTIVE.set(True)
+        try:
+            try: _request(venue, 'POST', None, body, confirmed, cancel=True)
+            except Exception: pass  # Never repeat an uncertain cancellation.
+        finally:
+            _EXTERNAL_CANCEL_ACTIVE.reset(cancel_token)
+            _PAIR_ACTIVE.reset(pair_token)
+        record['state'] = 'cancel_reconciliation_required'
+        _write_journal(path, record)
+        return {'state': record['state'], 'venue': venue, 'client_id': client_id, 'order_id': order_id}
+    except DemoBlocked:
+        raise
+    except Exception:
+        raise DemoBlocked('Open demo order could not be canceled safely') from None
+    finally:
+        if locked: unlock(fd)
+        os.close(fd)
+
+
+def _read_external_cancel(path: Path) -> dict[str, Any]:
+    import stat
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    with os.fdopen(fd, 'rb') as file:
+        info = os.fstat(file.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_size > 1_048_576 or
+                (os.name != 'nt' and (info.st_uid != os.geteuid() or info.st_mode & 0o077))):
+            raise ValueError('Invalid cancel journal')
+        record = json.loads(file.read(1_048_577))
+    if (not isinstance(record, dict) or type(record.get('version')) is not int or record['version'] != 1 or
+            record.get('state') not in ('cancel_submitting', 'cancel_reconciliation_required', 'cancel_resolved') or
+            not isinstance(record.get('id'), str) or not re.fullmatch(r'[a-f0-9]{32}', record['id']) or
+            record.get('venue') not in _VENUES or not isinstance(record.get('base'), str) or
+            not re.fullmatch(r'[A-Z][A-Z0-9]{1,14}', record['base']) or not isinstance(record.get('order_id'), str) or
+            not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', record['order_id'])):
+        raise ValueError('Invalid cancel journal')
+    _validate_route(record['venue'], 'POST', None, record['fields'])
+    symbol = record['fields']['symbol' if record['venue'] == 'bybit' else 'instId']
+    if symbol != record['base'] + ('USDT' if record['venue'] == 'bybit' else '-USDT-SWAP'):
+        raise ValueError('Invalid cancel instrument')
+    return record
+
+
+def reconcile_external_cancel(*, confirmed: bool = False, max_age_ms: int = 30_000) -> dict[str, Any]:
+    """Clear a cancellation block only after terminal status and positions agree."""
+    from execution import demo_futures_data
+    if confirmed is not True: raise DemoBlocked('Explicit reconciliation confirmation required')
+    _permit(False, read_only=True)
+    directory = execution_mode._directory()
+    path, main = directory / 'demo-futures-cancel-intent.json', _journal_path()
+    if not directory.is_dir(): raise DemoBlocked('Cancel journal unavailable')
+    fd = os.open(main.with_suffix('.lock'), os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    locked = False
+    try:
+        locked = lock_exclusive(fd, blocking=False)
+        if not locked: raise DemoBlocked('Another operation is in progress')
+        record = _read_external_cancel(path)
+        venue, base, fields = record['venue'], record['base'], record['fields']
+        proof = demo_futures_data.lookup_single_terminal_fill(venue, base, fields, order_id=record['order_id'], max_age_ms=max_age_ms)
+        matched_existing = False
+        if main.exists() or main.is_symlink():
+            try:
+                pair, pair_record = _read_open_journal_for_close(main, allowed_states=frozenset({'open_confirmed', 'closed_confirmed'}))
+                if pair.base == base:
+                    if pair_record['state'] == 'open_confirmed':
+                        demo_futures_data.verify_step(pair, pair_record['legs'], 2, max_age_ms=max_age_ms, require_fills=False)
+                    else:
+                        demo_futures_data.verify_flat(pair, max_age_ms=max_age_ms)
+                    matched_existing = True
+            except DemoBlocked:
+                single = _read_single_journal(main, states=frozenset({'open_confirmed', 'open_partial_confirmed', 'closed_confirmed'}))
+                leg = single['legs'][0]
+                if single['base'] == base and leg['venue'] == venue and not single.get('pending_recovery'):
+                    target = dict(leg['request'])
+                    key = 'qty' if venue == 'bybit' else 'sz'
+                    target[key] = single.get('remaining_qty', leg.get('reconciled_fill', {}).get('filled_qty', target[key]))
+                    demo_futures_data.verify_single_position(venue, base, target, flat=single['state'] == 'closed_confirmed', max_age_ms=max_age_ms)
+                    matched_existing = True
+        if not matched_existing:
+            demo_futures_data.verify_single_position(venue, base, fields, flat=True, max_age_ms=max_age_ms)
+        record['state'] = 'cancel_resolved'
+        record['terminal'] = proof
+        _write_journal(path, record)
+        archive = directory / ('demo-futures-cancel-resolved-' + record['id'] + '.json')
+        try: os.link(path, archive, follow_symlinks=False)
+        except FileExistsError:
+            if not os.path.samefile(path, archive): raise
+        os.unlink(path)
+        if os.name != 'nt':
+            dfd = os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+            try: os.fsync(dfd)
+            finally: os.close(dfd)
+        return {'state': 'cancel_resolved', 'order': proof}
+    except DemoBlocked:
+        raise
+    except Exception:
+        raise DemoBlocked('Cancellation or positions are not confirmed') from None
+    finally:
+        if locked: unlock(fd)
+        os.close(fd)

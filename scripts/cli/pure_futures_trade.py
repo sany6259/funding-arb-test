@@ -17,6 +17,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+if __name__ == '__main__':
+    from launch_backend import load_project_env
+    load_project_env(ROOT.parent)
 
 from execution.pure_futures_executor import (  # noqa: E402
     close_pure_futures_pair,

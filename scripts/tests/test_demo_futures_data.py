@@ -1069,15 +1069,24 @@ def test_integrated_open_confirm_close_with_no_preflight_or_transport_bypass(exc
 
 
 def test_pure_futures_demo_signal_runs_full_cycle_offline(exchange, monkeypatch, capsys):
-    from execution.run_pure_futures_spread import run_once
+    from execution import run_pure_futures_spread as runner
+    from backtest.funding_providers import get_funding_provider
     from cli import pure_futures_trade
     responses, _ = exchange
     fake = LifecycleExchange(responses)
     monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
-    cfg = {'dry_run': False, 'pureFuturesArbitrage': {'demoBase': 'BTC', 'tradeUsdPerPair': '2000'}}
-    result = run_once(cfg)
-    assert result['signal']['long_venue'] == 'bybit' and result['signal']['short_venue'] == 'okx'
-    assert result['actions'][0]['result']['state'] == 'open_confirmed'
+    monkeypatch.setattr(runner, 'time', SimpleNamespace(time=lambda: NOW / 1000))
+    provider = get_funding_provider('okx')
+    monkeypatch.setattr(provider, '_any_cache', None)
+    monkeypatch.setattr(provider, '_mark_cache', None)
+    monkeypatch.setattr(provider, '_index_cache', None)
+    with pytest.raises(demo.DemoBlocked):
+        runner.run_once({'dry_run': False, 'pureFuturesArbitrage': {'demoBase': 'BTC', 'tradeUsdPerPair': '2000'}})
+    cfg = {'dry_run': False, 'demoStrategy': {'trade_usd': '2000', 'min_spread_pct': '0.01', 'min_net_pct': '0.01',
+           'exit_spread_pct': '0', 'max_mark_spread_pct': '0.5', 'max_leverage': '3', 'max_fee_pct': '0.1',
+           'max_slippage_pct': '0.1', 'max_funding_gap_sec': 600, 'interval_sec': 30}}
+    result = runner.run_once(cfg)
+    assert result['cycle']['result']['state'] == 'open_confirmed'
     monkeypatch.setattr(sys, 'argv', ['trade', 'demo-positions', 'BTC'])
     assert pure_futures_trade.main() == 0
     displayed = json.loads(capsys.readouterr().out)
@@ -1274,3 +1283,600 @@ def test_manual_resolution_rejects_conflicting_terminal_statuses(exchange):
     with pytest.raises(data.DemoDataBlocked):
         data.verify_terminal_order('bybit', 'BTC', journal_record(1)['legs'][0]['request'], max_age_ms=10_000)
     assert calls and all(req.method == 'GET' for req in calls)
+
+
+def test_issue22_read_only_positions_without_order_permission(exchange, monkeypatch):
+    """Demo reads do not require order permission, but still enforce mode and dry-run."""
+    responses, calls = exchange
+    execution_mode.set_demo_orders_enabled(False)
+    assert data.read('bybit', 'BTC', 'position').payload == responses[('bybit', '/v5/position/list')]
+    assert data.read('okx', 'BTC', 'position').payload == responses[('okx', '/api/v5/account/positions')]
+    assert all(request.method == 'GET' for request in calls)
+    with pytest.raises(demo.DemoBlocked):
+        demo.execute_pair(pair(), confirmed=True, risk_limits=limits())
+    monkeypatch.setenv('FARB_DRY_RUN', '1')
+    with pytest.raises(data.DemoDataBlocked):
+        data.read('bybit', 'BTC', 'position')
+    monkeypatch.delenv('FARB_DRY_RUN')
+    execution_mode.set_mode('simulation')
+    with pytest.raises(data.DemoDataBlocked):
+        data.read('okx', 'BTC', 'position')
+
+
+def test_issue22_web_manual_pair_full_cycle_on_mock_transport(exchange, monkeypatch):
+    """Exercise web controls through real permission, preflight, journal and adapters."""
+    import asyncio
+    from types import SimpleNamespace
+    from server.routes import demo_trading
+
+    class Request:
+        def __init__(self, payload, host='127.0.0.1'):
+            self.payload = payload
+            self.client = SimpleNamespace(host=host)
+            self.url = SimpleNamespace(hostname='127.0.0.1')
+            self.headers = {'content-type': 'application/json'}
+        async def json(self):
+            return self.payload
+
+    async def immediate(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+    monkeypatch.setattr(demo_trading.asyncio, 'to_thread', immediate)
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    execution_mode.set_demo_orders_enabled(False)
+    async def run():
+        assert (await demo_trading.positions(Request({'base': 'BTC'})))['result']['okx']['positions'] == []
+        payload = {'base': 'BTC', 'long_venue': 'bybit', 'short_venue': 'okx', 'amount_usd': '2000', 'confirmed': True}
+        assert (await demo_trading.open_pair(Request(payload))).status_code == 409
+        assert (await demo_trading.permission(Request({'enabled': True, 'confirmed': True}, host='192.0.2.1'))).status_code == 403
+        assert (await demo_trading.permission(Request({'enabled': True, 'confirmed': True})))['orders_enabled']
+        result = await demo_trading.open_pair(Request(payload))
+        assert result['result']['state'] == 'open_confirmed'
+        summary = (await demo_trading.journal(Request({})))['result']
+        assert summary['state'] == 'open_confirmed' and len(summary['legs']) == 2
+        assert all(leg['confirmed'] for leg in summary['legs'])
+        result = await demo_trading.positions(Request({'base': 'BTC'}))
+        assert result['result']['bybit']['positions'][0]['size'] != '0'
+        assert result['result']['okx']['positions'][0]['pos'] != '0'
+        assert not (await demo_trading.stop_openings(Request({'confirmed': True})))['openings_enabled']
+        assert (await demo_trading.open_pair(Request(payload))).status_code == 409
+        assert (await demo_trading.close_pair(Request({'confirmed': True})))['result']['state'] == 'closed_confirmed'
+        assert (await demo_trading.permission(Request({'enabled': False, 'confirmed': True})))['orders_enabled'] is False
+    asyncio.run(run())
+    posted = [(urlsplit(req.full_url).hostname, json.loads(req.data)) for req in fake.calls if req.method == 'POST']
+    assert [host for host, _ in posted] == ['api-demo.bybit.com', 'www.okx.com', 'www.okx.com', 'api-demo.bybit.com']
+    assert all(fields['reduceOnly'] is True for _, fields in posted[2:])
+    assert all(req.get_header('X-simulated-trading') == '1' for req in fake.calls if urlsplit(req.full_url).hostname == 'www.okx.com')
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'partial', 'rejected'])
+def test_issue22_web_uncertain_order_blocks_repeat(exchange, monkeypatch, failure):
+    import asyncio
+    from types import SimpleNamespace
+    from server.routes import demo_trading
+
+    class Request:
+        def __init__(self, payload):
+            self.payload = payload
+            self.client = SimpleNamespace(host='127.0.0.1')
+            self.url = SimpleNamespace(hostname='127.0.0.1')
+            self.headers = {'content-type': 'application/json'}
+        async def json(self):
+            return self.payload
+
+    async def immediate(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+    monkeypatch.setattr(demo_trading.asyncio, 'to_thread', immediate)
+    fake = LifecycleExchange(exchange[0])
+    if failure == 'timeout':
+        fake.fail_post = 'bybit'
+    elif failure == 'partial':
+        fake.partial = 'bybit'
+    else:
+        fake.reject_post = 'bybit'
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    payload = {'base': 'BTC', 'long_venue': 'bybit', 'short_venue': 'okx', 'amount_usd': '2000', 'confirmed': True}
+    async def run():
+        result = await demo_trading.open_pair(Request(payload))
+        assert result['result']['state'] == 'reconciliation_required'
+        journal = (await demo_trading.journal(Request({})))['result']
+        assert journal['state'] == 'reconciliation_required'
+        assert journal['legs'][0]['client_id']
+        assert (await demo_trading.open_pair(Request(payload))).status_code == 409
+    asyncio.run(run())
+    assert len([request for request in fake.calls if request.method == 'POST']) == 1
+
+
+def test_issue22_auto_strategy_scans_opens_and_closes_via_mock_transport(exchange, monkeypatch):
+    from execution import run_pure_futures_spread as runner
+    from backtest.funding_providers import get_funding_provider
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    monkeypatch.setattr(runner, 'time', SimpleNamespace(time=lambda: NOW / 1000))
+    provider = get_funding_provider('okx')
+    monkeypatch.setattr(provider, '_any_cache', None)
+    monkeypatch.setattr(provider, '_mark_cache', None)
+    monkeypatch.setattr(provider, '_index_cache', None)
+    settings = {'trade_usd': '2000', 'min_spread_pct': '0.01', 'min_net_pct': '0.01',
+                'exit_spread_pct': '0', 'max_mark_spread_pct': '0.5', 'max_leverage': '3',
+                'max_fee_pct': '0.1', 'max_slippage_pct': '0.1', 'max_funding_gap_sec': 600,
+                'interval_sec': 30}
+    opened = runner.run_demo_strategy_once(settings)
+    assert opened['action'] == 'open' and opened['result']['state'] == 'open_confirmed'
+    assert len([req for req in fake.calls if req.method == 'POST']) == 2
+    responses[('okx', '/api/v5/public/funding-rate')]['data'][0]['fundingRate'] = '-0.01'
+    closed = runner.run_demo_strategy_once(settings)
+    assert closed['action'] == 'close' and closed['result']['state'] == 'closed_confirmed'
+    orders = [json.loads(req.data) for req in fake.calls if req.method == 'POST']
+    assert len(orders) == 4 and all(order['reduceOnly'] for order in orders[2:])
+
+
+@pytest.mark.parametrize('failure', ['partial', 'timeout', 'margin'])
+def test_issue22_auto_strategy_blocks_unknown_or_insufficient_margin(exchange, monkeypatch, failure):
+    from execution import run_pure_futures_spread as runner
+    from backtest.funding_providers import get_funding_provider
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    if failure == 'partial':
+        fake.partial = 'bybit'
+    elif failure == 'timeout':
+        fake.fail_post = 'bybit'
+    else:
+        responses[('bybit', '/v5/account/wallet-balance')]['result']['list'][0]['totalAvailableBalance'] = '0'
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    monkeypatch.setattr(runner, 'time', SimpleNamespace(time=lambda: NOW / 1000))
+    provider = get_funding_provider('okx')
+    monkeypatch.setattr(provider, '_any_cache', None)
+    monkeypatch.setattr(provider, '_mark_cache', None)
+    monkeypatch.setattr(provider, '_index_cache', None)
+    settings = {'trade_usd': '2000', 'min_spread_pct': '0.01', 'min_net_pct': '0.01',
+                'exit_spread_pct': '0', 'max_mark_spread_pct': '0.5', 'max_leverage': '3',
+                'max_fee_pct': '0.1', 'max_slippage_pct': '0.1', 'max_funding_gap_sec': 600, 'interval_sec': 30}
+    outcome = runner.run_demo_strategy_once(settings)
+    posted = [req for req in fake.calls if req.method == 'POST']
+    if failure == 'margin':
+        assert outcome['action'] == 'none' and not posted
+    else:
+        assert outcome['result']['state'] == 'reconciliation_required' and len(posted) == 1
+        with pytest.raises(demo.DemoBlocked):
+            runner.run_demo_strategy_once(settings)
+        assert len([req for req in fake.calls if req.method == 'POST']) == 1
+
+
+@pytest.mark.parametrize(('venue', 'side'), [('bybit', 'buy'), ('bybit', 'sell'), ('okx', 'buy'), ('okx', 'sell')])
+def test_issue22_single_demo_order_open_and_reduce_only_close(exchange, monkeypatch, venue, side):
+    from execution.demo_futures_preflight import TechnicalLimits
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    pair = data.single_for_notional(venue, 'BTC', side, '2000', max_age_ms=30_000)
+    assert demo.execute_single(pair, venue, side, confirmed=True, risk_limits=TechnicalLimits(30_000))['state'] == 'open_confirmed'
+    assert demo.close_single(confirmed=True, risk_limits=TechnicalLimits(30_000))['state'] == 'closed_confirmed'
+    sent = [json.loads(req.data) for req in fake.calls if req.method == 'POST']
+    assert len(sent) == 2 and 'reduceOnly' not in sent[0] and sent[1]['reduceOnly'] is True
+    assert sent[0]['side'].lower() != sent[1]['side'].lower()
+    assert demo.execute_single(pair, venue, side, confirmed=True, risk_limits=TechnicalLimits(30_000))['state'] == 'open_confirmed'
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'partial', 'rejected'])
+def test_issue22_single_uncertain_never_retries(exchange, monkeypatch, failure):
+    from execution.demo_futures_preflight import TechnicalLimits
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    if failure == 'timeout': fake.fail_post = 'bybit'
+    elif failure == 'partial': fake.partial = 'bybit'
+    else: fake.reject_post = 'bybit'
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    pair = data.single_for_notional('bybit', 'BTC', 'buy', '2000', max_age_ms=30_000)
+    result = demo.execute_single(pair, 'bybit', 'buy', confirmed=True, risk_limits=TechnicalLimits(30_000))
+    assert result['state'] == 'reconciliation_required'
+    with pytest.raises(demo.DemoBlocked):
+        demo.execute_single(pair, 'bybit', 'buy', confirmed=True, risk_limits=TechnicalLimits(30_000))
+    with pytest.raises(demo.DemoBlocked):
+        demo.close_single(confirmed=True, risk_limits=TechnicalLimits(30_000))
+    assert len([req for req in fake.calls if req.method == 'POST']) == 1
+
+
+def test_issue22_reconcile_terminal_partial_single_then_reduce_only_close(exchange, monkeypatch):
+    from execution.demo_futures_preflight import TechnicalLimits
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    fake.partial = 'bybit'
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    pair = data.single_for_notional('bybit', 'BTC', 'buy', '2000', max_age_ms=30_000)
+    assert demo.execute_single(pair, 'bybit', 'buy', confirmed=True, risk_limits=TechnicalLimits(30_000))['state'] == 'reconciliation_required'
+    responses[('bybit', '/v5/position/list')]['result']['list'][0]['size'] = '0.004'
+    original_open = fake.open
+    def terminal(request, timeout):
+        query = parse_qs(urlsplit(request.full_url).query)
+        if request.method == 'GET' and 'orderLinkId' in query:
+            order_id, (_, fields) = next(iter(fake.orders.items()))
+            payload = bybit({'list': [{'orderId': order_id, 'orderLinkId': fields['orderLinkId'],
+                       'symbol': fields['symbol'], 'side': fields['side'], 'orderStatus': 'Cancelled',
+                       'cumExecQty': '0.004', 'avgPrice': '100000'}], 'nextPageCursor': ''})
+            class Response:
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+                def read(self, limit): return json.dumps(payload).encode()
+            fake.calls.append(request)
+            return Response()
+        return original_open(request, timeout)
+    fake.open = terminal
+    assert demo.reconcile_single(confirmed=True)['state'] == 'open_partial_confirmed'
+    fake.partial = None
+    assert demo.close_single(confirmed=True, risk_limits=TechnicalLimits(30_000))['state'] == 'closed_confirmed'
+    posted = [json.loads(req.data) for req in fake.calls if req.method == 'POST']
+    assert len(posted) == 2 and posted[1]['reduceOnly'] is True and posted[1]['qty'] == '0.004'
+
+
+def test_issue22_reconcile_partial_close_requires_explicit_new_close(exchange, monkeypatch):
+    from execution.demo_futures_preflight import TechnicalLimits
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    pair = data.single_for_notional('bybit', 'BTC', 'buy', '2000', max_age_ms=30_000)
+    assert demo.execute_single(pair, 'bybit', 'buy', confirmed=True, risk_limits=TechnicalLimits(30_000))['state'] == 'open_confirmed'
+    fake.partial = 'bybit'
+    assert demo.close_single(confirmed=True, risk_limits=TechnicalLimits(30_000))['state'] == 'close_reconciliation_required'
+    responses[('bybit', '/v5/position/list')]['result']['list'][0].update(size='0.016', side='Buy')
+    original_open = fake.open
+    def terminal(request, timeout):
+        query = parse_qs(urlsplit(request.full_url).query)
+        if request.method == 'GET' and 'orderLinkId' in query:
+            oid, (_, fields) = next((oid, item) for oid, item in fake.orders.items() if item[1]['orderLinkId'] == query['orderLinkId'][0])
+            payload = bybit({'list': [{'orderId': oid, 'orderLinkId': fields['orderLinkId'], 'symbol': fields['symbol'],
+                       'side': fields['side'], 'orderStatus': 'Cancelled', 'cumExecQty': '0.004',
+                       'avgPrice': '100000', 'reduceOnly': True}], 'nextPageCursor': ''})
+            class Response:
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+                def read(self, limit): return json.dumps(payload).encode()
+            fake.calls.append(request)
+            return Response()
+        return original_open(request, timeout)
+    fake.open = terminal
+    result = demo.reconcile_single(confirmed=True)
+    assert result['state'] == 'open_partial_confirmed' and result['remaining_qty'] == '0.016'
+    assert len([req for req in fake.calls if req.method == 'POST']) == 2
+    fake.partial = None
+    assert demo.close_single(confirmed=True, risk_limits=TechnicalLimits(30_000))['state'] == 'closed_confirmed'
+    posted = [json.loads(req.data) for req in fake.calls if req.method == 'POST']
+    assert len(posted) == 3 and posted[-1]['qty'] == '0.016' and posted[-1]['reduceOnly'] is True
+
+
+def test_issue22_history_uses_demo_credentials_and_redacts_response(exchange, monkeypatch):
+    from server.routes.demo_trading import _history
+    responses, calls = exchange
+    responses[('bybit', '/v5/order/history')] = bybit({'list': [{'symbol': 'BTCUSDT', 'orderId': 'a', 'extra_secret': 'dummy-secret'}], 'nextPageCursor': ''})
+    responses[('bybit', '/v5/position/closed-pnl')] = bybit({'list': [{'symbol': 'BTCUSDT', 'closedPnl': '2'}], 'nextPageCursor': ''})
+    responses[('bybit', '/v5/account/transaction-log')] = bybit({'list': [{'symbol': 'BTCUSDT', 'funding': '0.4'}, {'symbol': 'ETHUSDT', 'funding': '1'}], 'nextPageCursor': ''})
+    responses[('bybit', '/v5/execution/list')] = bybit({'list': [{'symbol': 'BTCUSDT', 'execId': 'b', 'execFee': '0.1'}], 'nextPageCursor': ''})
+    responses[('okx', '/api/v5/trade/orders-history')] = okx([{'instId': 'BTC-USDT-SWAP', 'ordId': 'c', 'extra_secret': 'dummy-secret'}])
+    responses[('okx', '/api/v5/account/positions-history')] = okx([{'instId': 'BTC-USDT-SWAP', 'realizedPnl': '3', 'fundingFee': '1'}])
+    responses[('okx', '/api/v5/account/bills')] = okx([{'instId': 'BTC-USDT-SWAP', 'pnl': '0.5'}])
+    responses[('okx', '/api/v5/trade/fills')] = okx([{'instId': 'BTC-USDT-SWAP', 'tradeId': 'd', 'fee': '-0.1'}])
+    execution_mode.set_demo_orders_enabled(False)
+    result = _history('BTC')
+    assert result['bybit']['fills'][0]['execFee'] == '0.1'
+    assert result['okx']['closed_positions'][0]['fundingFee'] == '1'
+    assert len(result['bybit']['funding']) == 1 and result['bybit']['funding'][0]['funding'] == '0.4'
+    assert 'dummy-secret' not in json.dumps(result)
+    assert all(request.method == 'GET' for request in calls)
+    assert all(urlsplit(request.full_url).hostname in ('api-demo.bybit.com', 'www.okx.com') for request in calls)
+
+
+def test_issue22_demo_strategy_settings_survive_reload_and_fail_closed(exchange):
+    from execution import run_pure_futures_spread as runner
+    settings = {'trade_usd': '2000', 'min_spread_pct': '0.01', 'min_net_pct': '0.01',
+                'exit_spread_pct': '0', 'max_mark_spread_pct': '0.5', 'max_leverage': '3',
+                'max_fee_pct': '0.1', 'max_slippage_pct': '0.1', 'max_funding_gap_sec': 600, 'interval_sec': 30}
+    assert runner.save_demo_strategy_settings(settings) == runner.load_demo_strategy_settings()
+    path = execution_mode._directory() / 'demo-strategy-settings.json'
+    path.write_text('{broken')
+    with pytest.raises(demo.DemoBlocked): runner.load_demo_strategy_settings()
+
+
+def test_issue22_shared_stop_blocks_automatic_close_but_preserves_manual_close(exchange):
+    token = demo._STRATEGY_ACTIVE.set(True)
+    try:
+        execution_mode.set_demo_openings_enabled(False)
+        with pytest.raises(demo.DemoBlocked):
+            demo._permit(True)
+    finally:
+        demo._STRATEGY_ACTIVE.reset(token)
+    demo._permit(True)
+    with pytest.raises(demo.DemoBlocked):
+        demo._permit(True, opening=True)
+
+
+def test_issue22_first_pair_leg_partial_recovery_then_explicit_close(exchange, monkeypatch):
+    from execution.demo_futures_preflight import TechnicalLimits
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    fake.partial = 'bybit'
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    assert demo.execute_pair(pair(), confirmed=True, risk_limits=limits())['state'] == 'reconciliation_required'
+    responses[('bybit', '/v5/position/list')]['result']['list'][0].update(size='0.004', side='Buy')
+    original_open = fake.open
+    def terminal(request, timeout):
+        query = parse_qs(urlsplit(request.full_url).query)
+        if request.method == 'GET' and 'orderLinkId' in query:
+            oid, (_, fields) = next(iter(fake.orders.items()))
+            payload = bybit({'list': [{'orderId': oid, 'orderLinkId': fields['orderLinkId'], 'symbol': fields['symbol'],
+                       'side': fields['side'], 'orderStatus': 'Cancelled', 'cumExecQty': '0.004',
+                       'avgPrice': '100000'}], 'nextPageCursor': ''})
+            class Response:
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+                def read(self, limit): return json.dumps(payload).encode()
+            fake.calls.append(request)
+            return Response()
+        return original_open(request, timeout)
+    fake.open = terminal
+    result = demo.reconcile_pair_first_leg(confirmed=True)
+    assert result['state'] == 'open_partial_confirmed' and result['recovered_from_pair'] is True
+    assert len([req for req in fake.calls if req.method == 'POST']) == 1
+    fake.partial = None
+    assert demo.close_single(confirmed=True, risk_limits=TechnicalLimits(30_000))['state'] == 'closed_confirmed'
+    posted = [json.loads(req.data) for req in fake.calls if req.method == 'POST']
+    assert len(posted) == 2 and posted[-1]['qty'] == '0.004' and posted[-1]['reduceOnly'] is True
+    assert list(demo._journal_path().parent.glob('demo-futures-pair-recovery-*.json'))
+
+
+def test_issue22_second_pair_leg_partial_recovery_then_close_both(exchange, monkeypatch):
+    from server.routes.demo_trading import _close_pair_or_recovery
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    fake.partial = 'okx'
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    assert demo.execute_pair(pair(), confirmed=True, risk_limits=limits())['state'] == 'reconciliation_required'
+    responses[('okx', '/api/v5/account/positions')]['data'][0]['pos'] = '-0.3'
+    original_open = fake.open
+    def terminal(request, timeout):
+        query = parse_qs(urlsplit(request.full_url).query)
+        if request.method == 'GET' and 'clOrdId' in query:
+            oid, (_, fields) = next((oid, item) for oid, item in fake.orders.items() if item[0] == 'okx')
+            payload = okx([{'ordId': oid, 'clOrdId': fields['clOrdId'], 'instId': fields['instId'],
+                            'side': fields['side'], 'state': 'canceled', 'accFillSz': '0.3', 'avgPx': '100000'}])
+            class Response:
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+                def read(self, limit): return json.dumps(payload).encode()
+            fake.calls.append(request)
+            return Response()
+        return original_open(request, timeout)
+    fake.open = terminal
+    result = demo.reconcile_pair_second_leg(confirmed=True)
+    assert result['state'] == 'open_partial_confirmed' and result['pending_leg'] == 'bybit'
+    assert len([req for req in fake.calls if req.method == 'POST']) == 2
+    fake.partial = None
+    assert _close_pair_or_recovery()['state'] == 'closed_confirmed'
+    posted = [(urlsplit(req.full_url).hostname, json.loads(req.data)) for req in fake.calls if req.method == 'POST']
+    assert [host for host, _ in posted] == ['api-demo.bybit.com', 'www.okx.com', 'www.okx.com', 'api-demo.bybit.com']
+    assert all(fields['reduceOnly'] is True for _, fields in posted[2:])
+    assert posted[2][1]['sz'] == '0.3'
+    assert responses[('okx', '/api/v5/account/positions')]['data'] == []
+    assert responses[('bybit', '/v5/position/list')]['result']['list'][0]['size'] == '0'
+
+
+@pytest.mark.parametrize('failed_venue', ['okx', 'bybit'])
+def test_issue22_pair_close_partial_reconciles_then_closes_residuals(exchange, monkeypatch, failed_venue):
+    from server.routes.demo_trading import _close_pair_or_recovery
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    assert demo.execute_pair(pair(), confirmed=True, risk_limits=limits())['state'] == 'open_confirmed'
+    fake.partial = failed_venue
+    assert demo.close_pair(confirmed=True, close_confirmed=True, risk_limits=limits())['state'] == 'close_reconciliation_required'
+    if failed_venue == 'okx':
+        responses[('okx', '/api/v5/account/positions')]['data'] = [{'instId': 'BTC-USDT-SWAP', 'posSide': 'net', 'mgnMode': 'cross', 'pos': '-1.5'}]
+    else:
+        responses[('bybit', '/v5/position/list')]['result']['list'][0].update(size='0.014', side='Buy')
+    original_open = fake.open
+    def terminal(request, timeout):
+        query = parse_qs(urlsplit(request.full_url).query)
+        url = urlsplit(request.full_url)
+        if request.method == 'GET' and ('clOrdId' in query or 'orderLinkId' in query):
+            client = query.get('clOrdId', query.get('orderLinkId'))[0]
+            oid, (venue, fields) = next((oid, item) for oid, item in fake.orders.items() if
+                                       item[1]['orderLinkId' if item[0] == 'bybit' else 'clOrdId'] == client)
+            if venue == 'okx':
+                payload = okx([{'ordId': oid, 'clOrdId': client, 'instId': fields['instId'], 'side': fields['side'],
+                                'state': 'canceled', 'accFillSz': '0.3', 'avgPx': '100000', 'reduceOnly': 'true'}])
+            else:
+                payload = bybit({'list': [{'orderId': oid, 'orderLinkId': client, 'symbol': fields['symbol'], 'side': fields['side'],
+                                  'orderStatus': 'Cancelled', 'cumExecQty': '0.004', 'avgPrice': '100000', 'reduceOnly': True}], 'nextPageCursor': ''})
+            class Response:
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+                def read(self, limit): return json.dumps(payload).encode()
+            fake.calls.append(request)
+            return Response()
+        return original_open(request, timeout)
+    fake.open = terminal
+    result = demo.reconcile_pair_closing(confirmed=True)
+    assert result['state'] == 'open_partial_confirmed'
+    old_count = len([req for req in fake.calls if req.method == 'POST'])
+    assert old_count == (3 if failed_venue == 'okx' else 4)
+    fake.partial = None
+    assert _close_pair_or_recovery()['state'] == 'closed_confirmed'
+    assert responses[('okx', '/api/v5/account/positions')]['data'] == []
+    assert responses[('bybit', '/v5/position/list')]['result']['list'][0]['size'] == '0'
+    posted = [json.loads(req.data) for req in fake.calls if req.method == 'POST']
+    assert all(order['reduceOnly'] is True for order in posted[2:])
+
+
+def test_issue22_web_strategy_start_stop_and_shared_permission(exchange, monkeypatch):
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+    from server.routes import demo_trading
+    gate = threading.Event()
+    entered = threading.Event()
+    calls = []
+    def cycle(settings):
+        calls.append(settings)
+        entered.set()
+        assert gate.wait(5)
+        return {'action': 'hold', 'base': 'BTC'}
+    monkeypatch.setattr(demo_trading, 'run_demo_strategy_once', cycle)
+    class Request:
+        def __init__(self, payload):
+            self.payload = payload
+            self.client = SimpleNamespace(host='127.0.0.1')
+            self.url = SimpleNamespace(hostname='127.0.0.1')
+            self.headers = {'content-type': 'application/json'}
+        async def json(self): return self.payload
+    settings = {'trade_usd': '2000', 'min_spread_pct': '0.01', 'min_net_pct': '0.01',
+                'exit_spread_pct': '0', 'max_mark_spread_pct': '0.5', 'max_leverage': '3',
+                'max_fee_pct': '0.1', 'max_slippage_pct': '0.1', 'max_funding_gap_sec': 600, 'interval_sec': 30}
+    async def run():
+        result = await demo_trading.start_strategy(Request({'confirmed': True, 'settings': settings}))
+        assert result['running'] is True and entered.wait(2)
+        duplicate = await demo_trading.start_strategy(Request({'confirmed': True, 'settings': settings}))
+        assert duplicate.status_code == 409
+        stopped = await demo_trading.stop_strategy(Request({'confirmed': True}))
+        assert stopped['stopping'] is True and not execution_mode.current_state()['openings_enabled']
+        with pytest.raises(ValueError, match='strategy'):
+            execution_mode.set_demo_openings_enabled(True, confirmed=True)
+        gate.set()
+    try:
+        asyncio.run(run())
+    finally:
+        gate.set()
+        if demo_trading._auto_thread is not None:
+            demo_trading._auto_thread.join(5)
+    assert not demo_trading._auto_state['running'] and len(calls) == 1
+    execution_mode.set_demo_openings_enabled(True, confirmed=True)
+    events = (execution_mode._directory() / 'demo-strategy-events.jsonl').read_text()
+    assert [json.loads(line)['action'] for line in events.splitlines()] == ['started', 'hold', 'stopped']
+    assert 'dummy-secret' not in events
+
+
+def test_issue22_history_follows_cursors_and_rejects_loops(exchange, monkeypatch):
+    class HistoryTransport:
+        def __init__(self): self.loop = False
+        def open(self, request, timeout):
+            url = urlsplit(request.full_url)
+            query = parse_qs(url.query)
+            assert url.hostname == 'api-demo.bybit.com' and request.method == 'GET'
+            cursor = query.get('cursor', [''])[0]
+            if not cursor:
+                payload = bybit({'list': [{'orderId': '1'}], 'nextPageCursor': 'cursor1'})
+            else:
+                payload = bybit({'list': [{'orderId': '2'}], 'nextPageCursor': 'cursor1' if self.loop else ''})
+            class Response:
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+                def read(self, limit): return json.dumps(payload).encode()
+            return Response()
+    fake = HistoryTransport()
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    assert [row['orderId'] for row in data.all_history('bybit', 'BTC', 'history')] == ['1', '2']
+    fake.loop = True
+    with pytest.raises(data.DemoDataBlocked): data.all_history('bybit', 'BTC', 'history')
+
+
+def test_issue22_lost_ack_recovers_by_client_id_without_retry(exchange, monkeypatch):
+    from execution.demo_futures_preflight import TechnicalLimits
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    original_open = fake.open
+    failed = False
+    def transport(request, timeout):
+        nonlocal failed
+        url = urlsplit(request.full_url)
+        query = parse_qs(url.query)
+        if request.method == 'POST' and url.path == '/v5/order/create' and not failed:
+            original_open(request, timeout)  # Exchange accepted, response was lost.
+            failed = True
+            raise TimeoutError('mock lost acknowledgement')
+        if request.method == 'GET' and 'orderLinkId' in query:
+            oid, (_, fields) = next(iter(fake.orders.items()))
+            payload = bybit({'list': [{'orderId': oid, 'orderLinkId': fields['orderLinkId'], 'symbol': fields['symbol'],
+                       'side': fields['side'], 'orderStatus': 'Filled', 'cumExecQty': fields['qty'],
+                       'avgPrice': '100000'}], 'nextPageCursor': ''})
+            class Response:
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+                def read(self, limit): return json.dumps(payload).encode()
+            fake.calls.append(request)
+            return Response()
+        return original_open(request, timeout)
+    fake.open = transport
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    assert demo.execute_pair(pair(), confirmed=True, risk_limits=limits())['state'] == 'reconciliation_required'
+    # A new reader reconstructs state only from the durable journal and exchange responses.
+    record = json.loads(demo._journal_path().read_text())
+    assert 'order_id' not in record['legs'][0]
+    recovered = demo.reconcile_pair_first_leg(confirmed=True)
+    assert recovered['state'] == 'open_confirmed' and recovered['order']['order_id'] == '1'
+    assert len([req for req in fake.calls if req.method == 'POST']) == 1
+    assert demo.close_single(confirmed=True, risk_limits=TechnicalLimits(30_000))['state'] == 'closed_confirmed'
+    assert len([req for req in fake.calls if req.method == 'POST']) == 2
+
+
+def test_issue22_cancel_existing_demo_order_once_then_reconcile(exchange, monkeypatch):
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    responses[('bybit', '/v5/order/realtime')] = bybit({'list': [{'symbol': 'BTCUSDT', 'orderId': 'ext1',
+        'orderLinkId': 'client123', 'side': 'Buy', 'qty': '0.01', 'orderStatus': 'New'}], 'nextPageCursor': ''})
+    original_open = fake.open
+    terminal = False
+    def transport(request, timeout):
+        query = parse_qs(urlsplit(request.full_url).query)
+        if request.method == 'GET' and 'orderLinkId' in query:
+            payload = bybit({'list': [{'symbol': 'BTCUSDT', 'orderId': 'ext1', 'orderLinkId': 'client123',
+                'side': 'Buy', 'orderStatus': 'Cancelled' if terminal else 'New', 'cumExecQty': '0', 'avgPrice': ''}], 'nextPageCursor': ''})
+            class Response:
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+                def read(self, limit): return json.dumps(payload).encode()
+            fake.calls.append(request)
+            return Response()
+        return original_open(request, timeout)
+    fake.open = transport
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    assert demo.cancel_open_order('bybit', 'BTC', 'client123', confirmed=True)['state'] == 'cancel_reconciliation_required'
+    with pytest.raises(demo.DemoBlocked): demo.cancel_open_order('bybit', 'BTC', 'client123', confirmed=True)
+    with pytest.raises(demo.DemoBlocked): demo._permit(True)
+    with pytest.raises(demo.DemoBlocked): demo.reconcile_external_cancel(confirmed=True)
+    terminal = True
+    responses[('bybit', '/v5/order/realtime')] = bybit({'list': [], 'nextPageCursor': ''})
+    assert demo.reconcile_external_cancel(confirmed=True)['state'] == 'cancel_resolved'
+    demo._permit(True)
+    posts = [req for req in fake.calls if req.method == 'POST']
+    assert len(posts) == 1 and urlsplit(posts[0].full_url).path == '/v5/order/cancel'
+
+
+def test_issue22_cancel_existing_okx_order_stays_in_demo(exchange, monkeypatch):
+    responses, _ = exchange
+    fake = LifecycleExchange(responses)
+    responses[('okx', '/api/v5/trade/orders-pending')] = okx([{'instId': 'BTC-USDT-SWAP', 'ordId': '99',
+        'clOrdId': 'client987', 'side': 'sell', 'sz': '1', 'state': 'live'}])
+    original_open = fake.open
+    terminal = False
+    def transport(request, timeout):
+        query = parse_qs(urlsplit(request.full_url).query)
+        if request.method == 'GET' and 'clOrdId' in query:
+            payload = okx([{'instId': 'BTC-USDT-SWAP', 'ordId': '99', 'clOrdId': 'client987',
+                            'side': 'sell', 'state': 'canceled' if terminal else 'live', 'accFillSz': '0', 'avgPx': ''}])
+            class Response:
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+                def read(self, limit): return json.dumps(payload).encode()
+            fake.calls.append(request)
+            return Response()
+        return original_open(request, timeout)
+    fake.open = transport
+    monkeypatch.setattr(data.urllib.request, 'build_opener', lambda handler: fake)
+    assert demo.cancel_open_order('okx', 'BTC', 'client987', confirmed=True)['state'] == 'cancel_reconciliation_required'
+    terminal = True
+    responses[('okx', '/api/v5/trade/orders-pending')] = okx([])
+    assert demo.reconcile_external_cancel(confirmed=True)['state'] == 'cancel_resolved'
+    posts = [req for req in fake.calls if req.method == 'POST']
+    assert len(posts) == 1 and urlsplit(posts[0].full_url).hostname == 'www.okx.com'
+    assert urlsplit(posts[0].full_url).path == '/api/v5/trade/cancel-order'
+    assert posts[0].get_header('X-simulated-trading') == '1'

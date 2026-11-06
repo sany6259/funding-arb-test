@@ -24,26 +24,28 @@ from venues.http_util import http_get_json  # noqa: E402
 
 Book = dict[str, list[tuple[float, float]]]  # {"bids": [(px, qty)], "asks": [...]}
 
-_OKX_CTVAL_CACHE: tuple[float, dict[str, float]] | None = None
+_OKX_CTVAL_CACHE: tuple[str, float, dict[str, float]] | None = None
 _OKX_CTVAL_TTL_S = 3600.0
 
 
 def _okx_ctval_map() -> dict[str, float]:
     """OKX depth quantities are in contracts; multiply by ctVal to convert to base currency (1h cache)."""
     global _OKX_CTVAL_CACHE
+    from core.execution_mode import current_mode
+    mode = current_mode()
     now = time.time()
-    if _OKX_CTVAL_CACHE and now - _OKX_CTVAL_CACHE[0] < _OKX_CTVAL_TTL_S:
-        return _OKX_CTVAL_CACHE[1]
+    if mode != 'demo' and _OKX_CTVAL_CACHE and _OKX_CTVAL_CACHE[0] == mode and now - _OKX_CTVAL_CACHE[1] < _OKX_CTVAL_TTL_S:
+        return _OKX_CTVAL_CACHE[2]
     payload = http_get_json(
         "https://www.okx.com/api/v5/public/instruments?instType=SWAP", timeout=20
     )
     out: dict[str, float] = {}
     for row in payload.get("data", []) if isinstance(payload, dict) else []:
         inst = str(row.get("instId", ""))
-        ctval = float(row.get("ctVal", 0) or 0)
+        ctval = float(row.get("ctVal", 0) or 0) * float(row.get("ctMult", 1) or 1)
         if inst and ctval > 0:
             out[inst] = ctval
-    _OKX_CTVAL_CACHE = (now, out)
+    _OKX_CTVAL_CACHE = (mode, now, out)
     return out
 
 

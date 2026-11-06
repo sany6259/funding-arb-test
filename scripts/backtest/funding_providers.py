@@ -370,7 +370,8 @@ class OkxFundingProvider(FundingProvider):
     def _fetch_any(self) -> list[dict[str, Any]]:
         """instId=ANY fetches all-market funding in one request (shared 60s cache between fetch_all/interval_map)."""
         now = time.time()
-        if self._any_cache and now - self._any_cache[0] < self._ANY_CACHE_TTL_S:
+        from core.execution_mode import current_mode
+        if current_mode() != 'demo' and self._any_cache and now - self._any_cache[0] < self._ANY_CACHE_TTL_S:
             return self._any_cache[1]
         url = f"{self.BASE}/api/v5/public/funding-rate?instId=ANY"
         payload = _http_get_with_retry(url)
@@ -381,8 +382,12 @@ class OkxFundingProvider(FundingProvider):
     def _fetch_mark_prices(self) -> dict[str, float]:
         """Batch fetch OKX SWAP mark prices (60s cache, synchronized with _any_cache)."""
         now = time.time()
-        if self._mark_cache and now - self._mark_cache[0] < 60.0:
+        from core.execution_mode import current_mode
+        mode = current_mode()
+        if mode != 'demo' and self._mark_cache and now - self._mark_cache[0] < 60.0:
             return self._mark_cache[1]
+        if mode == 'demo':
+            self._index_cache = None
         try:
             payload = _http_get_with_retry(
                 "https://www.okx.com/api/v5/public/mark-price?instType=SWAP"
