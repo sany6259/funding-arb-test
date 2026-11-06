@@ -100,6 +100,8 @@ def set_demo_orders_enabled(enabled: bool, *, confirmed: bool = False) -> None:
         state = _read_state(directory)
         if enabled and state['mode'] != 'demo':
             raise ValueError('Demo mode required')
+        if enabled and not state['openings_enabled']:
+            _require_strategy_stopped(directory)
         state['orders_enabled'] = enabled
         state['openings_enabled'] = enabled
         _write_state(directory, state)
@@ -112,8 +114,21 @@ def set_demo_openings_enabled(enabled: bool, *, confirmed: bool = False) -> None
         state = _read_state(directory)
         if enabled and (state['mode'] != 'demo' or not state['orders_enabled']):
             raise ValueError('Demo order permission required')
+        if enabled and not state['openings_enabled']:
+            _require_strategy_stopped(directory)
         state['openings_enabled'] = enabled
         _write_state(directory, state)
+
+
+def _require_strategy_stopped(directory: Path) -> None:
+    """Prevent a stopped worker in another process from resuming unexpectedly."""
+    fd = os.open(directory / 'demo-strategy.lock', os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    try:
+        if not lock_exclusive(fd, blocking=False):
+            raise ValueError('Wait for demo strategy to stop')
+        unlock(fd)
+    finally:
+        os.close(fd)
 
 
 def current_state() -> dict:

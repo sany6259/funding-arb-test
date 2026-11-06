@@ -52,6 +52,10 @@ def _resources(venue: str, base: str) -> dict[str, tuple[str, dict[str, str]]]:
             'fills': ('/v5/execution/list', {'category': 'linear', 'symbol': symbol, 'limit': '100'}),
             'lookup_current': ('/v5/order/realtime', {'category': 'linear', 'symbol': symbol, 'limit': '50'}),
             'lookup_history': ('/v5/order/history', {'category': 'linear', 'symbol': symbol, 'limit': '50'}),
+            'history': ('/v5/order/history', {'category': 'linear', 'symbol': symbol, 'limit': '50'}),
+            'closed_pnl': ('/v5/position/closed-pnl', {'category': 'linear', 'symbol': symbol, 'limit': '50'}),
+            'funding_history': ('/v5/account/transaction-log', {'accountType': 'UNIFIED', 'category': 'linear',
+                                                                 'currency': 'USDT', 'type': 'SETTLEMENT', 'limit': '50'}),
         }
     if venue == 'okx':
         resources = {
@@ -67,6 +71,9 @@ def _resources(venue: str, base: str) -> dict[str, tuple[str, dict[str, str]]]:
             'leverage': ('/api/v5/account/leverage-info', {'instId': swap, 'mgnMode': 'cross'}),
             'fills': ('/api/v5/trade/fills', {'instType': 'SWAP', 'instId': swap, 'limit': '100'}),
             'lookup_order': ('/api/v5/trade/order', {'instId': swap}),
+            'history': ('/api/v5/trade/orders-history', {'instType': 'SWAP', 'instId': swap, 'limit': '100'}),
+            'closed_pnl': ('/api/v5/account/positions-history', {'instType': 'SWAP', 'instId': swap, 'limit': '100'}),
+            'funding_history': ('/api/v5/account/bills', {'instType': 'SWAP', 'instId': swap, 'type': '8', 'limit': '100'}),
         }
         for order_type in ('conditional', 'trigger', 'oco', 'move_order_stop', 'iceberg', 'twap'):
             resources['algo_' + order_type] = ('/api/v5/trade/orders-algo-pending',
@@ -91,7 +98,7 @@ def read(venue: str, base: str, resource: str, *, cursor: str | None = None,
             raise DemoDataBlocked('Invalid order identifier')
     elif client_id is not None or order_id is not None:
         raise DemoDataBlocked('Identifier is not valid for this resource')
-    paged = resource == 'fills' or (venue == 'bybit' and resource == 'lookup_history')
+    paged = resource in ('fills', 'history', 'closed_pnl', 'funding_history') or (venue == 'bybit' and resource == 'lookup_history')
     if cursor is not None and (not paged or not isinstance(cursor, str) or
                                not re.fullmatch(r'[A-Za-z0-9%_:.=+\-]{1,512}', cursor) or
                                (venue == 'okx' and not re.fullmatch(r'[0-9]{1,32}', cursor))):
@@ -259,6 +266,40 @@ def _all_fills(venue: str, base: str, *, max_pages: int = 20) -> tuple[list[dict
     raise ValueError('Execution history exceeds page limit')
 
 
+def all_history(venue: str, base: str, resource: str, *, max_pages: int = 20) -> list[dict[str, Any]]:
+    """Follow bounded exchange pagination or fail instead of presenting incomplete history."""
+    if resource not in ('history', 'closed_pnl', 'funding_history') or type(max_pages) is not int or not 1 <= max_pages <= 20:
+        raise DemoDataBlocked('Invalid history request')
+    rows: list[dict[str, Any]] = []
+    cursor = None
+    seen: set[str] = set()
+    try:
+        for _ in range(max_pages):
+            result = read(venue, base, resource, cursor=cursor).payload
+            if venue == 'bybit':
+                block = result['result']
+                batch, token = block['list'], block['nextPageCursor']
+                if not isinstance(token, str): raise ValueError('Missing cursor')
+                page_limit = 50
+            else:
+                batch, token, page_limit = result['data'], '', 100
+                if isinstance(batch, list) and len(batch) == page_limit:
+                    key = {'history': 'ordId', 'closed_pnl': 'posId', 'funding_history': 'billId'}[resource]
+                    token = batch[-1][key]
+                    if not isinstance(token, str) or not re.fullmatch(r'[0-9]{1,32}', token):
+                        raise ValueError('Missing cursor')
+            if not isinstance(batch, list) or len(batch) > page_limit or not all(isinstance(row, dict) for row in batch):
+                raise ValueError('Invalid history page')
+            rows.extend(batch)
+            if not token: return rows
+            if token in seen: raise ValueError('Repeated cursor')
+            seen.add(token)
+            cursor = token
+        raise ValueError('History exceeds page limit')
+    except Exception:
+        raise DemoDataBlocked('Demo history incomplete or unavailable') from None
+
+
 def collect(venue: str, base: str, side: str, quantity: str) -> VenueSnapshot:
     """Acquire and normalize a complete snapshot, with no default values.
 
@@ -270,7 +311,7 @@ def collect(venue: str, base: str, side: str, quantity: str) -> VenueSnapshot:
     try:
         wanted = _num(quantity, positive=True)
         reads = {name: read(venue, base, name) for name in _resources(venue, base)
-                 if name != 'fills' and not name.startswith('lookup_')}
+                 if name not in ('fills', 'history', 'closed_pnl', 'funding_history') and not name.startswith('lookup_')}
         data = {name: item.payload for name, item in reads.items()}
         _check_conditionals(venue, reads)
         symbol, swap = base + 'USDT', base + '-USDT-SWAP'
@@ -400,7 +441,8 @@ def pair_for_notional(base: str, long_venue: str, short_venue: str, notional_usd
         raise DemoDataBlocked('Demo pair sizing unavailable or invalid') from None
 
 
-def verify_technical_open(pair: demo.FuturesPair, *, max_age_ms: int) -> None:
+def verify_technical_open(pair: demo.FuturesPair, *, max_age_ms: int,
+                          venues: tuple[str, ...] | None = None) -> None:
     """Check demo contract, available margin, positions and pending orders."""
     if type(max_age_ms) is not int or max_age_ms <= 0:
         raise DemoDataBlocked('Invalid preflight age')
@@ -408,7 +450,10 @@ def verify_technical_open(pair: demo.FuturesPair, *, max_age_ms: int) -> None:
         pair.validate()
         start = int(time.time() * 1000)
         timestamps: list[int] = []
-        for venue in (pair.long_venue, pair.short_venue):
+        selected = (pair.long_venue, pair.short_venue) if venues is None else venues
+        if not isinstance(selected, tuple) or len(selected) not in (1, 2) or len(set(selected)) != len(selected) or any(v not in ('bybit', 'okx') for v in selected):
+            raise ValueError('Invalid venues')
+        for venue in selected:
             names = ['instrument', 'ticker' if venue == 'bybit' else 'mark',
                      'account', 'wallet', 'position', 'orders']
             if venue == 'bybit':
@@ -978,3 +1023,218 @@ def verify_close_step(pair: demo.FuturesPair, opening_legs: list[dict[str, Any]]
             raise ValueError('Stale close reconciliation')
     except Exception:
         raise DemoDataBlocked('Demo close state is uncertain; manual reconciliation required') from None
+
+
+def single_for_notional(venue: str, base: str, side: str, notional: str, *, max_age_ms: int) -> demo.FuturesPair:
+    """Size a single linear demo leg; the synthetic opposite leg is never sent."""
+    if venue not in ('bybit', 'okx') or side not in ('buy', 'sell'):
+        raise DemoDataBlocked('Invalid single leg')
+    try:
+        start = int(time.time() * 1000)
+        wanted = _num(notional, positive=True)
+        instrument = read(venue, base, 'instrument')
+        mark = read(venue, base, 'ticker' if venue == 'bybit' else 'mark')
+        if venue == 'bybit':
+            inst = _one(instrument.payload['result']['list'], 'symbol', base + 'USDT')
+            tick = _one(mark.payload['result']['list'], 'symbol', base + 'USDT')
+            step = _num(inst['lotSizeFilter']['qtyStep'], positive=True)
+            contract = Decimal(1)
+            price = _num(tick['markPrice'], positive=True)
+            stamps = (_stamp(instrument.payload['time']), _stamp(mark.payload['time']))
+        else:
+            inst = _one(instrument.payload['data'], 'instId', base + '-USDT-SWAP')
+            tick = _one(mark.payload['data'], 'instId', base + '-USDT-SWAP')
+            step = _num(inst['lotSz'], positive=True)
+            contract = _num(inst['ctVal'], positive=True) * _num(inst['ctMult'], positive=True)
+            price = _num(tick['markPx'], positive=True)
+            stamps = (_stamp(tick['ts']),)
+        with localcontext() as ctx:
+            ctx.prec = 80
+            units = (wanted / (price * contract) // step) * step
+            base_qty = units * contract
+            pair = demo.FuturesPair(base, 'bybit', 'okx', format(base_qty, 'f'),
+                                    format(units if venue == 'okx' else base_qty, 'f'),
+                                    format(contract if venue == 'okx' else Decimal(1), 'f'))
+            pair.validate()
+        now = int(time.time() * 1000)
+        if type(max_age_ms) is not int or max_age_ms <= 0 or now < start or any(
+                stamp > now or now - stamp > max_age_ms for stamp in (*stamps, instrument.started_ms, mark.started_ms)):
+            raise ValueError('Stale data')
+        return pair
+    except Exception:
+        raise DemoDataBlocked('Single demo leg sizing unavailable') from None
+
+
+def verify_single_position(venue: str, base: str, fields: dict[str, Any], *, flat: bool, max_age_ms: int) -> int:
+    """Check exact position, pending orders and conditional orders for one leg."""
+    try:
+        start = int(time.time() * 1000)
+        demo._validate_route(venue, 'POST', None, fields)
+        names = ['position', 'orders'] + (['conditional_orders'] if venue == 'bybit' else
+                ['algo_' + kind for kind in ('conditional', 'trigger', 'oco', 'move_order_stop', 'iceberg', 'twap')])
+        reads = {name: read(venue, base, name) for name in names}
+        _check_conditionals(venue, reads)
+        quantity = Decimal(0) if flat else _num(fields['qty' if venue == 'bybit' else 'sz'], positive=True)
+        stamps = [item.started_ms for item in reads.values()]
+        if venue == 'bybit':
+            if fields['symbol'] != base + 'USDT': raise ValueError('Symbol mismatch')
+            pos = _one(reads['position'].payload['result']['list'], 'symbol', base + 'USDT')
+            orders = reads['orders'].payload['result']
+            if (pos['positionIdx'] != 0 or _num(pos['size']) != quantity or
+                    (quantity and pos['side'] != fields['side']) or not isinstance(orders['list'], list) or
+                    orders['list'] or orders['nextPageCursor'] != ''):
+                raise ValueError('Position mismatch')
+            stamps.extend(_stamp(reads[name].payload['time']) for name in ('position', 'orders'))
+        else:
+            if fields['instId'] != base + '-USDT-SWAP': raise ValueError('Symbol mismatch')
+            positions, orders = reads['position'].payload['data'], reads['orders'].payload['data']
+            if not isinstance(positions, list) or not isinstance(orders, list) or orders:
+                raise ValueError('Position mismatch')
+            if quantity:
+                pos = _one(positions, 'instId', base + '-USDT-SWAP')
+                signed = quantity if fields['side'] == 'buy' else -quantity
+                if pos['posSide'] != 'net' or pos['mgnMode'] != 'cross' or _num(pos['pos']) != signed:
+                    raise ValueError('Position mismatch')
+            elif any(row.get('instId') != base + '-USDT-SWAP' or row.get('posSide') != 'net' or
+                     _num(row['pos']) != 0 for row in positions):
+                raise ValueError('Position remains')
+        now = int(time.time() * 1000)
+        if type(max_age_ms) is not int or max_age_ms <= 0 or now < start or any(
+                stamp > now or now - stamp > max_age_ms for stamp in stamps):
+            raise ValueError('Stale data')
+        return min(stamps)
+    except Exception:
+        raise DemoDataBlocked('Single demo position or orders are uncertain') from None
+
+
+def verify_single_close_instrument(venue: str, base: str, fields: dict[str, Any], *, max_age_ms: int) -> int:
+    """Check current market rules for an exact reduce-only close."""
+    try:
+        demo._validate_route(venue, 'POST', None, fields)
+        if fields.get('reduceOnly') is not True:
+            raise ValueError('Reduce-only required')
+        start = int(time.time() * 1000)
+        instrument = read(venue, base, 'instrument')
+        mark = read(venue, base, 'ticker' if venue == 'bybit' else 'mark')
+        if venue == 'bybit':
+            row = _one(instrument.payload['result']['list'], 'symbol', base + 'USDT')
+            tick = _one(mark.payload['result']['list'], 'symbol', base + 'USDT')
+            if fields['symbol'] != base + 'USDT' or row['contractType'] != 'LinearPerpetual' or row['status'] != 'Trading':
+                raise ValueError('Invalid instrument')
+            lot = row['lotSizeFilter']
+            step, minimum, maximum = (_num(lot[k], positive=True) for k in ('qtyStep', 'minOrderQty', 'maxMktOrderQty'))
+            quantity, contract = _num(fields['qty'], positive=True), Decimal(1)
+            price = _num(tick['markPrice'], positive=True)
+            minimum_notional = _num(lot['minNotionalValue'], positive=True)
+            stamps = [_stamp(instrument.payload['time']), _stamp(mark.payload['time'])]
+        else:
+            row = _one(instrument.payload['data'], 'instId', base + '-USDT-SWAP')
+            tick = _one(mark.payload['data'], 'instId', base + '-USDT-SWAP')
+            if (fields['instId'] != base + '-USDT-SWAP' or row['instType'] != 'SWAP' or row['ctType'] != 'linear' or
+                    row['ctValCcy'] != base or row['settleCcy'] != 'USDT' or row['state'] != 'live'):
+                raise ValueError('Invalid instrument')
+            step, minimum, maximum = (_num(row[k], positive=True) for k in ('lotSz', 'minSz', 'maxMktSz'))
+            quantity = _num(fields['sz'], positive=True)
+            contract = _num(row['ctVal'], positive=True) * _num(row['ctMult'], positive=True)
+            price, minimum_notional = _num(tick['markPx'], positive=True), Decimal(0)
+            stamps = [_stamp(tick['ts'])]
+        if not minimum <= quantity <= maximum or quantity % step or quantity * contract * price < minimum_notional:
+            raise ValueError('Invalid size')
+        now = int(time.time() * 1000)
+        if type(max_age_ms) is not int or max_age_ms <= 0 or now < start or any(
+                stamp > now or now - stamp > max_age_ms for stamp in (*stamps, instrument.started_ms, mark.started_ms)):
+            raise ValueError('Stale data')
+        return min(*stamps, instrument.started_ms, mark.started_ms)
+    except Exception:
+        raise DemoDataBlocked('Single close instrument unavailable') from None
+
+
+def lookup_single_terminal_fill(venue: str, base: str, fields: dict[str, Any], *, order_id: str | None, max_age_ms: int) -> dict[str, str]:
+    """Read a consistent terminal order and its executed quantity, without placing orders."""
+    try:
+        demo._validate_route(venue, 'POST', None, fields)
+        client_key = 'orderLinkId' if venue == 'bybit' else 'clOrdId'
+        symbol_key = 'symbol' if venue == 'bybit' else 'instId'
+        qty_key = 'qty' if venue == 'bybit' else 'sz'
+        if fields[symbol_key] != base + ('USDT' if venue == 'bybit' else '-USDT-SWAP'):
+            raise ValueError('Symbol mismatch')
+        start = int(time.time() * 1000)
+        resources = ('lookup_current', 'lookup_history') if venue == 'bybit' else ('lookup_order',)
+        observations = []
+        stamps = []
+        for resource in resources:
+            item = read(venue, base, resource, client_id=fields[client_key])
+            stamps.append(item.started_ms)
+            if venue == 'bybit':
+                rows = item.payload['result']['list']
+                stamps.append(_stamp(item.payload['time']))
+            else:
+                rows = item.payload['data']
+            if not isinstance(rows, list) or len(rows) > 1:
+                raise ValueError('Ambiguous response')
+            for row in rows:
+                oid = row['orderId' if venue == 'bybit' else 'ordId']
+                state = row['orderStatus' if venue == 'bybit' else 'state']
+                size = _num(row['cumExecQty' if venue == 'bybit' else 'accFillSz'])
+                raw_price = row.get('avgPrice' if venue == 'bybit' else 'avgPx')
+                price = _num(raw_price, positive=True) if size > 0 else Decimal(0)
+                terminal = ('Filled', 'Cancelled', 'Rejected', 'Deactivated', 'PartiallyFilledCanceled') if venue == 'bybit' else ('filled', 'canceled')
+                if (row.get(client_key) != fields[client_key] or row.get(symbol_key) != fields[symbol_key] or
+                        row.get('side') != fields['side'] or not isinstance(oid, str) or
+                        not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', oid) or (order_id is not None and oid != order_id) or
+                        state not in terminal or size < 0 or size > _num(fields[qty_key], positive=True) or
+                        (state in ('Filled', 'filled') and size != _num(fields[qty_key], positive=True)) or
+                        (fields.get('reduceOnly') is True and row.get('reduceOnly') not in (True, 'true'))):
+                    raise ValueError('Order is not terminal or inconsistent')
+                observations.append((oid, state, size, price))
+        if not observations or len(set(observations)) != 1:
+            raise ValueError('Missing or conflicting order status')
+        now = int(time.time() * 1000)
+        if type(max_age_ms) is not int or max_age_ms <= 0 or now < start or any(
+                stamp > now or now - stamp > max_age_ms for stamp in stamps):
+            raise ValueError('Stale status')
+        oid, state, size, price = observations[0]
+        return {'venue': venue, 'order_id': oid, 'state': state, 'filled_qty': format(size, 'f'), 'avg_price': format(price, 'f')}
+    except Exception:
+        raise DemoDataBlocked('Terminal demo order status unavailable') from None
+
+
+def demo_pair_costs(pair: demo.FuturesPair, *, max_age_ms: int) -> dict[str, Any]:
+    """Get fresh account fees and executable book slippage for a sized pair."""
+    try:
+        pair.validate()
+        start = int(time.time() * 1000)
+        stamps = []
+        result = {}
+        for venue, side in ((pair.long_venue, 'buy'), (pair.short_venue, 'sell')):
+            reads = {name: read(venue, pair.base, name) for name in ('fees', 'book', 'ticker' if venue == 'bybit' else 'mark')}
+            stamps.extend(item.started_ms for item in reads.values())
+            if venue == 'bybit':
+                symbol = pair.base + 'USDT'
+                fee = _one(reads['fees'].payload['result']['list'], 'symbol', symbol)
+                mark = _one(reads['ticker'].payload['result']['list'], 'symbol', symbol)
+                book = reads['book'].payload['result']
+                if book['s'] != symbol: raise ValueError('Book mismatch')
+                price, rate, contract = _num(mark['markPrice'], positive=True), _num(fee['takerFeeRate']), Decimal(1)
+                levels = book['a' if side == 'buy' else 'b']
+                stamps.extend((_stamp(reads['ticker'].payload['time']), _stamp(book['ts'])))
+            else:
+                symbol = pair.base + '-USDT-SWAP'
+                fees = reads['fees'].payload['data']
+                if not isinstance(fees, list) or len(fees) != 1: raise ValueError('Fee unavailable')
+                mark = _one(reads['mark'].payload['data'], 'instId', symbol)
+                book = _one_scoped(reads['book'].payload['data'], 'instId', symbol)
+                price, rate = _num(mark['markPx'], positive=True), abs(_num(fees[0]['taker']))
+                contract = _num(pair.okx_contract_size, positive=True)
+                levels = book['asks' if side == 'buy' else 'bids']
+                stamps.extend((_stamp(mark['ts']), _stamp(book['ts'])))
+            if not Decimal(0) <= rate <= Decimal(1): raise ValueError('Invalid fee')
+            slip = _book_slippage(levels, _num(pair.base_quantity, positive=True), contract, price, side)
+            result[venue] = {'fee_rate': format(rate, 'f'), 'slippage_rate': slip, 'mark_price': format(price, 'f')}
+        now = int(time.time() * 1000)
+        if type(max_age_ms) is not int or max_age_ms <= 0 or now < start or any(
+                stamp > now or now - stamp > max_age_ms for stamp in stamps):
+            raise ValueError('Stale cost data')
+        return result
+    except Exception:
+        raise DemoDataBlocked('Demo fee or executable order book unavailable') from None

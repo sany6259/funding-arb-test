@@ -141,6 +141,9 @@
               </n-card>
             </n-gi>
           </n-grid>
+          <n-alert v-if="executionMode === 'demo' && (pureData?.demo_unverified_count ?? 0) > 0" type="warning" style="margin-bottom: 12px">
+            {{ pureData?.demo_unverified_count }} сигналов пропущено: нет свежих комиссий, стакана или они не вошли в первые 10 проверяемых инструментов.
+          </n-alert>
           <n-data-table v-if="pureRows.length > 0" :columns="pureColumns" :data="pureRows" :bordered="false" :scroll-x="1480" :max-height="600" virtual size="small" striped />
           <n-empty v-else :description="t('scanner.noPureFutures')" style="padding:40px 0" />
         </template>
@@ -237,10 +240,11 @@
           </n-space>
         </n-form-item>
 
-        <n-form-item v-if="openMode === 'backend'" :label="t('scanner.dryRun')">
+        <n-form-item v-if="openMode === 'backend' && executionMode !== 'demo'" :label="t('scanner.dryRun')">
           <n-switch v-model:value="openDryRun" disabled />
           <n-text v-if="!openDryRun" type="error" style="margin-left: 12px; font-size: 12px">{{ t('scanner.realOrdersWarning') }}</n-text>
         </n-form-item>
+        <n-alert v-if="executionMode === 'demo'" type="warning">Открыть две фьючерсные ноги на демосчетах Bybit и OKX.</n-alert>
 
         <n-alert
           v-if="openTarget?.kind === 'pure' && openTarget.row.basis_risk_level !== 'clean'"
@@ -264,7 +268,7 @@
             {{ t('scanner.walletSignOpen') }}
           </n-button>
           <n-button v-else size="small" :type="openDryRun ? 'primary' : 'error'" :loading="opening" @click="confirmOpen">
-            {{ openDryRun ? t('scanner.openDryRun') : t('scanner.openLive') }}
+            {{ executionMode === 'demo' ? 'Открыть демопару' : (openDryRun ? t('scanner.openDryRun') : t('scanner.openLive')) }}
           </n-button>
         </n-space>
       </template>
@@ -279,6 +283,7 @@ import { RouterLink, useRoute } from 'vue-router'
 import { SearchOutline, TrendingUpOutline, FlashOutline, AnalyticsOutline } from '@vicons/ionicons5'
 import { post, useWebSocket, type ScannerOpportunities, type CarryVenue, type CarryCand, type UnifiedCarryCand, type WsMessage } from '@/composables/useApi'
 import { isDemoMode, useDemoSnapshot } from '@/composables/useDemoSnapshot'
+import { executionMode } from '@/composables/useExecutionMode'
 import { WALLET_TRADE_VENUES } from '@/constants/walletTrade'
 import { useWallet } from '@/composables/wallet'
 import { useI18n } from 'vue-i18n'
@@ -563,6 +568,10 @@ async function loadVenueCapabilities() {
 }
 
 function rowTradeBlock(row: PureRow): string {
+  if (!isDemoMode && executionMode.value === 'demo') {
+    return [row.long_venue, row.short_venue].sort().join(',') === 'bybit,okx' ? '' : 'Доступны только Bybit и OKX Demo.'
+  }
+  if (!isDemoMode && executionMode.value === 'unavailable') return 'Состояние режима недоступно.'
   for (const vid of [row.long_venue, row.short_venue]) {
     const cap = venueCaps.value[vid]
     if (cap && !cap.trade) return `${vid}: ${t('settings.scanOnly')}${isDemoMode ? ` (${t('demo.title')})` : cap.reason ? ` (${cap.reason})` : ''}`
@@ -925,6 +934,21 @@ async function confirmOpen() {
   if (!tgt) return
   opening.value = true
   try {
+    if (!isDemoMode && executionMode.value === 'demo') {
+      if (tgt.kind !== 'pure' || !Number.isFinite(openAmount.value) || openAmount.value <= 0) throw new Error('Допустима только фьючерсная демопара.')
+      const r = tgt.row
+      const response = await post<{ result: { state: string } }>('/demo/trading/open', {
+        base: r.base, long_venue: r.long_venue, short_venue: r.short_venue,
+        amount_usd: String(openAmount.value), confirmed: true,
+      })
+      if (response?.result?.state !== 'open_confirmed') {
+        message.warning('Исполнение не подтверждено. Проверьте журнал и позиции.')
+      } else {
+        message.success('Демопара открыта и подтверждена.')
+      }
+      showOpenModal.value = false
+      return
+    }
     if (!openDryRun.value) {
       message.error('Ордерная торговля отключена на этапе проверки демо.')
       return
@@ -1084,7 +1108,7 @@ async function confirmOpenWallet(tgt: OpenTarget) {
 
 // ---- Pure Futures ----
 type BasisRiskLevel = 'clean' | 'caution' | 'high'
-interface PureRow { base: string; direction: string; long_venue: string; short_venue: string; net_edge_pct: number; mark_spread_pct: number; real_edge_pct: number; annual_apy_pct: number; net_apy_pct: number; long_interval_h: number; short_interval_h: number; settle_mismatch: boolean; basis_risk_level: BasisRiskLevel }
+interface PureRow { base: string; direction: string; long_venue: string; short_venue: string; net_edge_pct: number; mark_spread_pct: number; real_edge_pct: number; annual_apy_pct: number; net_apy_pct: number; long_interval_h: number; short_interval_h: number; settle_mismatch: boolean; basis_risk_level: BasisRiskLevel; long_fee_pct?: number; short_fee_pct?: number; slippage_pct?: number; demo_costs_verified?: boolean }
 
 function toPureRow(i: import('@/composables/useApi').OpportunityItem, direction: string): PureRow {
   return {
@@ -1094,6 +1118,8 @@ function toPureRow(i: import('@/composables/useApi').OpportunityItem, direction:
     net_apy_pct: i.net_apy_pct ?? 0,
     long_interval_h: i.long_interval_h ?? 8, short_interval_h: i.short_interval_h ?? 8,
     settle_mismatch: i.settle_mismatch ?? (i.same_interval === false),
+    long_fee_pct: i.long_fee_pct, short_fee_pct: i.short_fee_pct, slippage_pct: i.slippage_pct,
+    demo_costs_verified: i.demo_costs_verified,
     basis_risk_level: inferBasisRiskLevel(i),
   }
 }
@@ -1178,6 +1204,10 @@ const pureColumns = computed<DataTableColumns<PureRow>>(() => [
   { title: t('scanner.dir'), key: 'direction', width: 75, render: (row) => h(NTag, { size: 'small', type: row.direction === 'Forward' ? 'success' : 'warning', bordered: false }, { default: () => row.direction === 'forward' ? t('scanner.forward') : row.direction === 'reverse' ? t('scanner.reverse') : row.direction }) },
   { title: t('scanner.long'), key: 'long_venue', width: 105, render: (row) => renderVenue(row.long_venue) },
   { title: t('scanner.short'), key: 'short_venue', width: 105, render: (row) => renderVenue(row.short_venue) },
+  ...(executionMode.value === 'demo' ? [
+    { title: 'Комиссии L/S, %', key: 'demo_fees', width: 130, render: (row: PureRow) => row.demo_costs_verified ? `${row.long_fee_pct?.toFixed(4)} / ${row.short_fee_pct?.toFixed(4)}` : '—' },
+    { title: 'Проскальзывание, %', key: 'demo_slippage', width: 130, render: (row: PureRow) => row.demo_costs_verified ? row.slippage_pct?.toFixed(4) : '—' },
+  ] : []),
   { title: t('scanner.interval'), key: 'interval', width: 90, render: (row) => {
     const label = `${fmtInterval(row.long_interval_h)}/${fmtInterval(row.short_interval_h)}`
     return h(NTag, { size: 'small', type: row.settle_mismatch ? 'warning' : 'default', bordered: false },

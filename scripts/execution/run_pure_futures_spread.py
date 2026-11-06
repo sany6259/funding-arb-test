@@ -22,6 +22,9 @@ from typing import Any
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
+if __name__ == '__main__':
+    from launch_backend import load_project_env
+    load_project_env(SCRIPTS_DIR.parent)
 
 from cli.scan_pure_futures_spreads import scan_pure_futures_spreads  # noqa: E402
 from core.strategy_config import (  # noqa: E402
@@ -91,25 +94,15 @@ def _open_positions() -> list[dict[str, Any]]:
 
 
 def _run_demo_once(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Use the pure-futures signal and isolated sequential demo executor."""
-    from execution import demo_futures, demo_futures_data
-    from execution.demo_futures_preflight import TechnicalLimits
-
-    pfa = cfg.get('pureFuturesArbitrage')
-    if not isinstance(pfa, dict) or cfg.get('dry_run') is not False:
+    """Apply the same explicit settings and checks as the dashboard runner."""
+    from execution import demo_futures
+    if cfg.get('dry_run') is not False or not isinstance(cfg.get('demoStrategy'), dict):
         raise demo_futures.DemoBlocked('Explicit demo strategy settings required')
-    base = pfa.get('demoBase')
-    notional = pfa.get('tradeUsdPerPair')
-    if not isinstance(base, str) or not isinstance(notional, (str, int, float)) or isinstance(notional, bool):
-        raise demo_futures.DemoBlocked('Demo base and position size are required')
-    limits = TechnicalLimits(30_000)
-    signal = demo_futures_data.pure_futures_signal(base.upper(), max_age_ms=limits.max_snapshot_age_ms)
-    pair = demo_futures_data.pair_for_notional(signal['base'], signal['long_venue'], signal['short_venue'],
-                                               str(notional), max_age_ms=limits.max_snapshot_age_ms)
-    result = demo_futures.execute_pair(pair, confirmed=True, risk_limits=limits)
-    return {'strategy': 'pure_futures_spread', 'mode': 'demo', 'signal': signal,
-            'actions': [{'action': 'open', 'result': result}],
-            'open_positions': 1 if result.get('state') == 'open_confirmed' else 0}
+    cycle = run_demo_strategy_once(cfg['demoStrategy'])
+    return {'strategy': 'pure_futures_spread', 'mode': 'demo', 'cycle': cycle,
+            'actions': [cycle] if cycle['action'] in ('open', 'close') else [],
+            'open_positions': int(cycle['action'] == 'hold' or
+                                  cycle.get('result', {}).get('state') == 'open_confirmed')}
 
 
 def run_once(cfg: dict[str, Any], *, verbose: bool = False) -> dict[str, Any]:
@@ -258,6 +251,27 @@ def main() -> int:
     args = parser.parse_args()
 
     cfg = _load_json(args.config)
+    from core import execution_mode
+    if execution_mode.current_mode() == 'demo':
+        from core.file_lock import lock_exclusive, unlock
+        from execution import demo_futures
+        directory = execution_mode._directory()
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(directory / 'demo-strategy.lock', os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        if not lock_exclusive(fd, blocking=False):
+            os.close(fd)
+            raise demo_futures.DemoBlocked('Another demo strategy is already running')
+        token = demo_futures._STRATEGY_ACTIVE.set(True)
+        try:
+            return _run_cli(cfg, args)
+        finally:
+            demo_futures._STRATEGY_ACTIVE.reset(token)
+            unlock(fd)
+            os.close(fd)
+    return _run_cli(cfg, args)
+
+
+def _run_cli(cfg: dict[str, Any], args: argparse.Namespace) -> int:
     if not args.once and not args.watch:
         args.once = True
 
@@ -279,6 +293,153 @@ def main() -> int:
             print(json.dumps(out, ensure_ascii=False))
         elapsed = time.time() - t0
         time.sleep(max(0.0, interval - elapsed))
+
+
+def validate_demo_strategy(settings: dict[str, Any]) -> dict[str, str | int]:
+    """Validate explicit demo strategy parameters; never infer trading limits."""
+    from decimal import Decimal, InvalidOperation
+    from execution.demo_futures import DemoBlocked
+    required = {'trade_usd', 'min_spread_pct', 'min_net_pct', 'exit_spread_pct',
+                'max_mark_spread_pct', 'max_leverage', 'max_fee_pct', 'max_slippage_pct',
+                'max_funding_gap_sec', 'interval_sec'}
+    if not isinstance(settings, dict) or set(settings) != required:
+        raise DemoBlocked('Explicit demo strategy settings required')
+    result: dict[str, str | int] = {}
+    for key in required - {'max_funding_gap_sec', 'interval_sec'}:
+        value = settings[key]
+        if not isinstance(value, str) or len(value) > 32:
+            raise DemoBlocked('Invalid strategy setting')
+        try:
+            number = Decimal(value)
+        except InvalidOperation:
+            raise DemoBlocked('Invalid strategy setting') from None
+        upper = Decimal('1000000000') if key == 'trade_usd' else Decimal('1') if key == 'max_mark_spread_pct' else Decimal('100')
+        if not number.is_finite() or number < 0 or number > upper:
+            raise DemoBlocked('Invalid strategy setting')
+        if key in ('trade_usd', 'max_leverage') and number <= 0:
+            raise DemoBlocked('Invalid strategy setting')
+        result[key] = format(number, 'f')
+    for key, low, high in (('interval_sec', 30, 86400), ('max_funding_gap_sec', 0, 604800)):
+        value = settings[key]
+        if type(value) is not int or not low <= value <= high:
+            raise DemoBlocked('Invalid strategy setting')
+        result[key] = value
+    return result
+
+
+def load_demo_strategy_settings() -> dict[str, str | int] | None:
+    """Load validated non-secret settings without enabling the strategy."""
+    import stat
+    from core import execution_mode
+    path = execution_mode._directory() / 'demo-strategy-settings.json'
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    except FileNotFoundError:
+        return None
+    try:
+        with os.fdopen(fd, 'rb') as file:
+            info = os.fstat(file.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_size > 4096 or
+                    (os.name != 'nt' and (info.st_uid != os.geteuid() or info.st_mode & 0o077))):
+                raise ValueError('Invalid settings file')
+            return validate_demo_strategy(json.loads(file.read(4097)))
+    except Exception:
+        from execution.demo_futures import DemoBlocked
+        raise DemoBlocked('Stored demo strategy settings are invalid') from None
+
+
+def save_demo_strategy_settings(settings: dict[str, Any]) -> dict[str, str | int]:
+    from core import execution_mode
+    from execution import demo_futures
+    checked = validate_demo_strategy(settings)
+    directory = execution_mode._directory()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    demo_futures._write_journal(directory / 'demo-strategy-settings.json', checked)
+    return checked
+
+
+def run_demo_strategy_once(settings: dict[str, Any]) -> dict[str, Any]:
+    """One bounded cycle using the existing scanner and journalled demo executor.
+
+    Both venues and every candidate are checked again using authenticated demo
+    funding, order book, instrument, fee, margin and account data before entry.
+    """
+    from decimal import Decimal
+    from execution import demo_futures, demo_futures_data
+    from execution.demo_futures_preflight import RiskLimits, evaluate
+    settings = validate_demo_strategy(settings)
+    demo_futures._permit(True)
+    max_age = 30_000
+    path = demo_futures._journal_path()
+    if path.exists() or path.is_symlink():
+        try:
+            pair, record = demo_futures._read_open_journal_for_close(
+                path, allowed_states=frozenset({'open_confirmed', 'closed_confirmed'}))
+        except demo_futures.DemoBlocked:
+            # A verified closed single can be archived by execute_pair; any
+            # open or uncertain single must continue blocking automation.
+            demo_futures._read_single_journal(path, states=frozenset({'closed_confirmed'}))
+            record = {'state': 'closed_confirmed'}
+        if record['state'] == 'open_confirmed':
+            try:
+                demo_futures_data.verify_step(pair, record['legs'], 2, max_age_ms=max_age, require_fills=False)
+            except demo_futures_data.DemoDataBlocked:
+                raise demo_futures.DemoBlocked('Open pair requires reconciliation') from None
+            try:
+                signal = demo_futures_data.pure_futures_signal(pair.base, max_age_ms=max_age)
+            except demo_futures_data.DemoDataBlocked:
+                return {'action': 'wait', 'base': pair.base, 'reason': 'demo_market_data_unavailable'}
+            spread = (Decimal(signal['short_funding_rate']) - Decimal(signal['long_funding_rate'])) * 100
+            if signal['long_venue'] != pair.long_venue:
+                spread = -spread
+            if spread <= Decimal(settings['exit_spread_pct']):
+                result = demo_futures.close_pair(confirmed=True, close_confirmed=True,
+                                                  risk_limits=demo_futures_data_limit(max_age))
+                return {'action': 'close', 'base': pair.base, 'spread_pct': str(spread), 'result': result}
+            return {'action': 'hold', 'base': pair.base, 'spread_pct': str(spread)}
+    demo_futures._permit(True, opening=True)
+    scan = scan_pure_futures_spreads(
+        venues=['bybit', 'okx'], min_spread=0, min_edge=-999,
+        max_mark_spread_pct=float(settings['max_mark_spread_pct']), fee_policy={'mode': 'vip_tier'},
+        with_depth=False, cache_ttl_sec=0.0)
+    if not isinstance(scan, dict) or set(scan.get('data_venues', [])) != {'bybit', 'okx'}:
+        return {'action': 'wait', 'reason': 'demo_market_data_unavailable'}
+    rows = scan.get('forward', []) + scan.get('reverse', [])
+    if not isinstance(rows, list):
+        raise demo_futures.DemoBlocked('Invalid demo scan')
+    limits = RiskLimits(max_age, max_age, 1, 604_800_000,
+                        int(settings['max_funding_gap_sec']) * 1000,
+                        str(settings['trade_usd']), str(settings['max_leverage']),
+                        str(settings['max_mark_spread_pct']),
+                        str(Decimal(settings['max_fee_pct']) / 100),
+                        str(Decimal(settings['max_slippage_pct']) / 100), '0',
+                        str(Decimal(settings['min_net_pct']) / 100))
+    for row in rows[:50]:
+        if not isinstance(row, dict) or {row.get('long_venue'), row.get('short_venue')} != {'bybit', 'okx'}:
+            continue
+        try:
+            pair = demo_futures_data.pair_for_notional(row['base'], row['long_venue'], row['short_venue'],
+                                                       str(settings['trade_usd']), max_age_ms=max_age)
+            long = demo_futures_data.collect(pair.long_venue, pair.base, 'buy', pair.base_quantity)
+            short = demo_futures_data.collect(pair.short_venue, pair.base, 'sell', pair.base_quantity)
+            spread = (Decimal(short.funding_rate) - Decimal(long.funding_rate)) * 100
+            if spread < Decimal(settings['min_spread_pct']):
+                continue
+            plan = evaluate(pair.base, pair.base_quantity, long, short, limits, now_ms=int(time.time() * 1000))
+            if (Decimal(plan.base_quantity) != Decimal(pair.base_quantity) or
+                    Decimal(plan.okx_contracts) != Decimal(pair.okx_contracts)):
+                continue
+        except Exception:
+            continue  # Invalid or unavailable candidate evidence cannot authorize an order.
+        result = demo_futures.execute_pair(pair, confirmed=True, risk_limits=limits)
+        return {'action': 'open', 'base': pair.base, 'spread_pct': str(spread),
+                'net_rate': plan.net_funding_after_estimated_costs, 'result': result}
+    return {'action': 'none', 'reason': 'no_valid_candidate'}
+
+
+def demo_futures_data_limit(max_age_ms: int):
+    from execution.demo_futures_preflight import TechnicalLimits
+    return TechnicalLimits(max_age_ms)
 
 
 if __name__ == "__main__":

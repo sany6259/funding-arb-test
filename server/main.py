@@ -110,6 +110,9 @@ async def _background_scanner_loop() -> None:
 
     async def _warm(strategy: str) -> None:
         try:
+            from core.execution_mode import current_mode
+            if strategy != 'pure' and current_mode() == 'demo':
+                return
             r = await scanner_trigger(strategy=strategy)
             if not r.get("success"):
                 print(f"[scanner] {strategy} scan: {r.get('error')}", flush=True)
@@ -167,6 +170,13 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # Stop any demo worker and revoke shared permission before shutdown.
+        # A request already holding the mode lock finishes before revocation.
+        demo_trading._auto_stop.set()
+        try:
+            set_demo_orders_enabled(False)
+        except Exception:
+            pass
         task.cancel()
         try:
             await task

@@ -43,6 +43,10 @@ export interface OpportunityItem {
   short_symbol?: string;
   fee_pct?: number;
   round_trip_fee_pct?: number;
+  long_fee_pct?: number;
+  short_fee_pct?: number;
+  slippage_pct?: number;
+  demo_costs_verified?: boolean;
   long_mark?: number;
   short_mark?: number;
   mark_spread_pct?: number;
@@ -62,6 +66,7 @@ export interface ScannerOpportunities {
   reverse: OpportunityItem[];
   venue_pair_stats: Array<{ pair: string; count: number }>;
   timestamp: string;
+  demo_unverified_count?: number;
 }
 
 export interface PositionItem {
